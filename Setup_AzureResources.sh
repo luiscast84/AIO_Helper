@@ -94,7 +94,7 @@ handle_azure_auth() {
     print_info "Checking Azure login status..."
     local login_check=$(az account show 2>/dev/null)
     
-    # If not logged in or no subscription, trigger login
+    # If not logged in, trigger login
     if [ $? -ne 0 ]; then
         print_info "Not logged in. Starting Azure login..."
         login_check=$(az login 2>/dev/null)
@@ -104,28 +104,49 @@ handle_azure_auth() {
         fi
     fi
 
-    # Get current subscription info
-    local sub_id=$(echo "$login_check" | jq -r .id 2>/dev/null)
-    local sub_name=$(echo "$login_check" | jq -r .name 2>/dev/null)
-    local tenant_id=$(echo "$login_check" | jq -r .tenantId 2>/dev/null)
-    local user_name=$(echo "$login_check" | jq -r .user.name 2>/dev/null)
-
-    # Verify we got valid subscription info
-    if [[ -z "$sub_id" || "$sub_id" == "null" ]]; then
-        print_error "No subscription found. Please make sure you have an active subscription"
+    # Parse subscription info from the JSON output
+    # Using printf to ensure newlines in JSON don't affect parsing
+    printf "%s" "$login_check" | jq -e . >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        print_error "Failed to parse Azure account information"
         exit 1
     fi
 
-    # Display subscription information
+    # Get subscription details
+    local sub_info=$(printf "%s" "$login_check" | jq -r '. | select(.id != null)')
+    if [ -z "$sub_info" ]; then
+        print_error "No subscription information found"
+        exit 1
+    fi
+
+    local sub_id=$(printf "%s" "$sub_info" | jq -r .id)
+    local sub_name=$(printf "%s" "$sub_info" | jq -r .name)
+    local tenant_name=$(printf "%s" "$sub_info" | jq -r .tenantId)
+    local user_name=$(printf "%s" "$sub_info" | jq -r .user.name)
+
+    # Verify subscription ID
+    if [[ -z "$sub_id" || "$sub_id" == "null" ]]; then
+        print_error "No valid subscription ID found"
+        exit 1
+    fi
+
+    # Display current session information
     print_success "Successfully authenticated with Azure"
     print_info "Active Subscription Details:"
-    print_info "Name      : $sub_name"
-    print_info "ID        : $sub_id"
-    print_info "Tenant    : $tenant_id"
-    print_info "User      : $user_name"
+    print_info "Subscription Name   : $sub_name"
+    print_info "Subscription ID     : $sub_id"
+    print_info "Tenant ID          : $tenant_name"
+    print_info "User               : $user_name"
 
     # Export subscription ID for use in script
     export SUBSCRIPTION_ID="$sub_id"
+    
+    # Verify subscription is active
+    if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
+        print_error "Failed to set subscription as active"
+        exit 1
+    fi
+    print_success "Successfully set active subscription"
 }
 
 # Main script starts here
