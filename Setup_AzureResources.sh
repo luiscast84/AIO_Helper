@@ -117,7 +117,45 @@ print_timing_summary() {
     echo -e "\nTotal execution time: $(format_time $total_time)"
 }
 
-# Function to validate and transform input
+# Function to check Azure login status
+check_azure_login() {
+    print_section "Azure Authentication"
+    
+    # Try to get current account info silently
+    if az account show >/dev/null 2>&1; then
+        local sub_info=$(az account show)
+        local sub_id=$(echo $sub_info | jq -r .id)
+        local sub_name=$(echo $sub_info | jq -r .name)
+        local tenant_id=$(echo $sub_info | jq -r .tenantId)
+        
+        print_success "Already logged in to Azure"
+        print_info "Current subscription:"
+        print_info "Name    : $sub_name"
+        print_info "ID      : $sub_id"
+        print_info "Tenant  : $tenant_id"
+        
+        OPERATION_STATUS["Azure Login"]="SKIPPED"
+        echo "$sub_id"
+        return 0
+    else
+        print_info "Not logged in to Azure."
+        print_info "A browser window will open for authentication."
+        print_info "Please complete the login process in your browser..."
+        
+        if ! track_operation "Azure Login" az login; then
+            print_error "Azure login failed"
+            return 1
+        fi
+        
+        # Get subscription ID after successful login
+        local sub_info=$(az account show)
+        local sub_id=$(echo $sub_info | jq -r .id)
+        echo "$sub_id"
+        return 0
+    fi
+}
+
+# Function to validate input
 validate_input() {
     local input=$1
     local type=$2
@@ -146,25 +184,6 @@ validate_input() {
     return 0
 }
 
-# Function to get and validate subscription
-get_subscription_info() {
-    local sub_info=$(az account show 2>/dev/null)
-    if [ $? -eq 0 ]; then
-        local sub_id=$(echo $sub_info | jq -r .id)
-        local sub_name=$(echo $sub_info | jq -r .name)
-        local sub_state=$(echo $sub_info | jq -r .state)
-        print_success "Using current subscription:"
-        print_info "Name    : $sub_name"
-        print_info "ID      : $sub_id"
-        print_info "State   : $sub_state"
-        echo "$sub_id"
-        return 0
-    else
-        print_error "No active subscription found"
-        exit 1
-    fi
-}
-
 # Main script
 print_section "Azure Arc Cluster Setup"
 print_info "This script will help you set up an Arc-enabled Kubernetes cluster in Azure"
@@ -175,22 +194,24 @@ if ! command -v az >/dev/null 2>&1; then
     exit 1
 fi
 
+# Check jq installation
+if ! command -v jq >/dev/null 2>&1; then
+    print_error "jq is not installed. Please install it first with: sudo apt-get install jq"
+    exit 1
+fi
+
 # Set resource group name (uppercase)
 RG_NAME="LAB460"
 print_success "Using resource group: $RG_NAME"
 
-# Handle Azure login and subscription
-print_section "Azure Authentication"
-if ! az account show >/dev/null 2>&1; then
-    print_info "Not logged in to Azure. Initiating login..."
-    track_operation "Azure Login" az login
-else
-    print_success "Already logged in to Azure"
-    OPERATION_STATUS["Azure Login"]="SKIPPED"
+# Handle Azure login and get subscription
+SUBSCRIPTION_ID=$(check_azure_login)
+if [ $? -ne 0 ]; then
+    print_error "Failed to authenticate with Azure"
+    exit 1
 fi
 
-# Get subscription ID
-SUBSCRIPTION_ID=$(get_subscription_info)
+# Set subscription
 track_operation "Set Subscription" az account set --subscription "$SUBSCRIPTION_ID"
 
 # Get location
@@ -228,7 +249,7 @@ PROVIDERS=(
 )
 
 for provider in "${PROVIDERS[@]}"; do
-    track_operation "Register $provider" az provider register -n "$provider"
+    track_operation "Register $provider" az provider register -n "$provider" --wait
 done
 
 # Add/upgrade extensions
@@ -276,12 +297,14 @@ track_operation "Restart k3s" systemctl restart k3s
 track_operation "Create Key Vault" az keyvault create \
     --enable-rbac-authorization \
     --name $AKV_NAME \
-    --resource-group $RG_NAME
+    --resource-group $RG_NAME \
+    --location $LOCATION
 
 # Create Storage Account
 track_operation "Create Storage Account" az storage account create \
     --name $STORAGE_NAME \
     --resource-group $RG_NAME \
+    --location $LOCATION \
     --enable-hierarchical-namespace
 
 # Save environment variables
