@@ -2,6 +2,15 @@
 
 ################################################################################
 # Azure Arc Resource Setup Script
+#
+# This script automates the setup of Azure Arc-enabled Kubernetes cluster and
+# associated resources, handling proper privilege management for each operation.
+#
+# Requirements:
+# - Run as a normal user (not root)
+# - Sudo privileges available for system operations
+# - Azure CLI installed
+# - kubectl and jq commands available
 ################################################################################
 
 # Color codes for pretty output
@@ -17,31 +26,41 @@ readonly RESOURCE_GROUP="LAB460"  # Fixed resource group name
 
 # Arrays to track status
 declare -A ACTION_TIMES
+declare -A INSTALLED_PACKAGES
+declare -A SKIPPED_PACKAGES
+declare -A FAILED_PACKAGES
+declare -A SYSTEM_CHANGES
 
 ################################################################################
 # Utility Functions
 ################################################################################
 
+# Function to print formatted section headers
 print_section() {
     echo -e "\n${BLUE}=== $1 ===${NC}"
 }
 
+# Function to print info messages
 log_info() { 
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
+# Function to print success messages
 log_success() { 
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
+# Function to print warning messages
 log_warning() { 
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
+# Function to print error messages
 log_error() { 
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Function to measure execution time of actions
 time_action() {
     local start_time=$(date +%s)
     local action_name="$1"
@@ -53,63 +72,73 @@ time_action() {
     return $status
 }
 
+# Function to format text (lowercase and remove spaces)
 format_text() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' '
 }
 
+# Function to check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to check if running as root
 is_root() {
     [ "$(id -u)" -eq 0 ]
 }
-
 ################################################################################
-# Privilege Management
+# Privilege Management Functions
 ################################################################################
 
+# Function to check and store sudo credentials
 check_sudo_privileges() {
     print_section "Checking Sudo Privileges"
     
+    # Prevent running as root
     if is_root; then
         log_error "Please run this script as a normal user (not root)"
         log_info "The script will ask for sudo password when needed"
         exit 1
     fi
     
+    # Inform user about sudo requirements
     log_info "This script requires sudo privileges for:"
     echo "  - Installing system packages"
     echo "  - Configuring k3s"
     echo "  - Modifying system settings"
     echo -e "\nOther operations like Azure login will run as current user"
     
+    # Check if we can get sudo
     if ! sudo -v; then
         log_error "Unable to get sudo privileges"
         exit 1
     fi
     
-    # Keep sudo alive
+    # Keep sudo alive in the background
     (while true; do sudo -n true; sleep 50; kill -0 "$$" || exit; done 2>/dev/null) &
     SUDO_KEEPER_PID=$!
     
+    # Ensure we kill the sudo keeper on script exit
     trap 'kill $SUDO_KEEPER_PID 2>/dev/null' EXIT
     
     log_success "Sudo privileges confirmed"
 }
 
 ################################################################################
-# Azure Authentication
+# Azure Authentication Functions
 ################################################################################
 
+# Function to check Azure login status
 check_azure_login() {
     print_section "Checking Azure Authentication"
     
+    # Check if az CLI is installed
     if ! command -v az >/dev/null 2>&1; then
         log_error "Azure CLI is not installed. Please install it first."
         exit 1
     fi
     
+    # Try to get current Azure login status
     if az account show &>/dev/null; then
         log_info "Current Azure login information:"
         az account show --query "{Subscription:name,UserName:user.name,TenantID:tenantId}" -o table
@@ -121,25 +150,24 @@ check_azure_login() {
         fi
     fi
     
+    # Need to login
     log_info "Azure login required. Opening browser..."
     if ! az login --use-device-code; then
         log_error "Azure login failed"
         return 1
     fi
     
+    # Show login information
     log_info "Logged in successfully. Account information:"
     az account show --query "{Subscription:name,UserName:user.name,TenantID:tenantId}" -o table
     return 0
 }
-################################################################################
-# Subscription Management
-################################################################################
 
+# Function to get and validate subscription
 get_subscription() {
     print_section "Checking Subscription"
     
     # Try to get current subscription
-    local current_sub
     if current_sub=$(az account show --query id -o tsv 2>/dev/null); then
         log_info "Current subscription: $(az account show --query name -o tsv)"
         log_info "Subscription ID: $current_sub"
@@ -147,6 +175,7 @@ get_subscription() {
         log_success "Using current subscription: $SUBSCRIPTION_ID"
         return 0
     else
+        # If no current subscription, show available ones
         log_info "Available subscriptions:"
         az account list --query "[].{Name:name, ID:id, State:state}" -o table
         
@@ -164,9 +193,10 @@ get_subscription() {
 }
 
 ################################################################################
-# Resource Group Management
+# Resource Group Management Functions
 ################################################################################
 
+# Function to check resource group existence and location
 check_resource_group() {
     print_section "Checking Resource Group"
     
@@ -187,6 +217,7 @@ check_resource_group() {
     fi
 }
 
+# Function to get and validate Azure location
 get_location() {
     print_section "Setting Azure Location"
     
@@ -203,11 +234,43 @@ get_location() {
         fi
     done
 }
-
 ################################################################################
-# Resource Names Management
+# Kubernetes Setup Functions
 ################################################################################
 
+# Function to install kubectl
+install_kubectl() {
+    print_section "Installing kubectl"
+    
+    # Remove any existing kubectl installation
+    if command -v kubectl &>/dev/null; then
+        log_info "Removing existing kubectl installation..."
+        sudo apt-get remove -y kubectl &>/dev/null
+    fi
+    
+    # Add Kubernetes repository and key
+    log_info "Adding Kubernetes repository..."
+    sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | \
+        sudo tee /etc/apt/sources.list.d/kubernetes.list
+    
+    # Update apt and install kubectl
+    log_info "Installing kubectl..."
+    sudo apt-get update
+    sudo apt-get install -y kubectl
+    
+    # Verify installation
+    if ! command -v kubectl &>/dev/null; then
+        log_error "kubectl installation failed"
+        return 1
+    fi
+    
+    log_success "kubectl installed successfully"
+    kubectl version --client
+    return 0
+}
+
+# Function to get resource names
 get_resource_names() {
     print_section "Getting Resource Names"
     
@@ -227,12 +290,7 @@ get_resource_names() {
         read -p "Enter storage account base name: " storage_base
         STORAGE_NAME=$(format_text "${storage_base}st")
         if [[ $STORAGE_NAME =~ ^[a-z0-9]{3,24}$ ]]; then
-            # Check if storage account name is available
-            if az storage account check-name --name "$STORAGE_NAME" --query "nameAvailable" -o tsv | grep -q "true"; then
-                break
-            else
-                log_error "Storage account name '$STORAGE_NAME' is not available. Please choose another name."
-            fi
+            break
         else
             log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
         fi
@@ -243,107 +301,14 @@ get_resource_names() {
         read -p "Enter key vault base name: " kv_base
         AKV_NAME=$(format_text "${kv_base}akv")
         if [[ $AKV_NAME =~ ^[a-z0-9-]{3,24}$ ]]; then
-            # Check if key vault name is available
-            if ! az keyvault name-exists --name "$AKV_NAME"; then
-                break
-            else
-                log_error "Key vault name '$AKV_NAME' is not available. Please choose another name."
-            fi
+            break
         else
             log_error "Invalid key vault name. Use 3-24 lowercase letters, numbers, and hyphens."
         fi
     done
 }
 
-################################################################################
-# Provider Registration
-################################################################################
-
-register_providers() {
-    print_section "Registering Azure Providers"
-    
-    local providers=(
-        "Microsoft.ExtendedLocation"
-        "Microsoft.Kubernetes"
-        "Microsoft.KubernetesConfiguration"
-        "Microsoft.IoTOperations"
-        "Microsoft.DeviceRegistry"
-        "Microsoft.SecretSyncController"
-    )
-    
-    for provider in "${providers[@]}"; do
-        log_info "Checking provider: $provider"
-        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
-        
-        if [ "$status" != "Registered" ]; then
-            log_info "Registering provider: $provider"
-            if ! az provider register -n "$provider"; then
-                log_error "Failed to register $provider"
-                return 1
-            fi
-            
-            # Wait for registration
-            log_info "Waiting for $provider registration..."
-            local max_attempts=30
-            local attempt=1
-            while [ $attempt -le $max_attempts ]; do
-                status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
-                if [ "$status" == "Registered" ]; then
-                    break
-                fi
-                log_info "Attempt $attempt/$max_attempts: Provider status: $status"
-                sleep 10
-                ((attempt++))
-            done
-        else
-            log_info "$provider already registered"
-        fi
-    done
-    
-    log_success "All providers successfully registered"
-    return 0
-}
-################################################################################
-# Kubernetes Setup
-################################################################################
-
-install_kubectl() {
-    print_section "Installing kubectl"
-    
-    # Remove any existing kubectl installation
-    if command -v kubectl &>/dev/null; then
-        log_info "Removing existing kubectl installation..."
-        sudo apt-get remove -y kubectl &>/dev/null
-    fi
-    
-    # Add Kubernetes repository and key
-    log_info "Adding Kubernetes repository..."
-    if ! sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg; then
-        log_error "Failed to download Kubernetes repository key"
-        return 1
-    fi
-    
-    echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | \
-        sudo tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
-    
-    # Update apt and install kubectl
-    log_info "Installing kubectl..."
-    sudo apt-get update
-    if ! sudo apt-get install -y kubectl; then
-        log_error "Failed to install kubectl"
-        return 1
-    fi
-    
-    # Verify installation
-    if ! command -v kubectl &>/dev/null; then
-        log_error "kubectl installation failed"
-        return 1
-    fi
-    
-    log_success "kubectl installed successfully"
-    return 0
-}
-
+# Function to verify kubeconfig
 verify_kubeconfig() {
     print_section "Verifying Kubernetes Configuration"
     
@@ -351,7 +316,7 @@ verify_kubeconfig() {
     if ! systemctl is-active --quiet k3s; then
         log_info "K3s service not running. Starting k3s..."
         sudo systemctl start k3s
-        sleep 10
+        sleep 10  # Wait for k3s to start
     fi
     
     # Ensure k3s.yaml exists
@@ -377,6 +342,7 @@ verify_kubeconfig() {
     return 0
 }
 
+# Function to setup connected kubernetes
 setup_connectedk8s() {
     print_section "Setting up Connected Kubernetes"
     
@@ -414,8 +380,6 @@ setup_connectedk8s() {
         --enable-oidc-issuer \
         --enable-workload-identity; then
         log_error "Failed to connect Kubernetes cluster"
-        log_info "Checking cluster status..."
-        kubectl cluster-info
         return 1
     fi
     
@@ -435,6 +399,7 @@ setup_connectedk8s() {
     return 0
 }
 
+# Function to configure k3s
 configure_k3s() {
     print_section "Configuring k3s"
     
@@ -485,9 +450,65 @@ configure_k3s() {
     return 0
 }
 ################################################################################
-# Azure Resource Creation
+# Azure Provider Registration Functions
 ################################################################################
 
+# Function to register Azure providers
+register_providers() {
+    print_section "Registering Azure Providers"
+    
+    local providers=(
+        "Microsoft.ExtendedLocation"
+        "Microsoft.Kubernetes"
+        "Microsoft.KubernetesConfiguration"
+        "Microsoft.IoTOperations"
+        "Microsoft.DeviceRegistry"
+        "Microsoft.SecretSyncController"
+    )
+    
+    for provider in "${providers[@]}"; do
+        log_info "Checking provider: $provider"
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
+        
+        if [ "$status" != "Registered" ]; then
+            log_info "Registering provider: $provider"
+            if ! az provider register -n "$provider"; then
+                log_error "Failed to register $provider"
+                return 1
+            fi
+            
+            # Wait for registration
+            log_info "Waiting for $provider registration..."
+            local max_attempts=30
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+                status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+                if [ "$status" == "Registered" ]; then
+                    break
+                fi
+                log_info "Attempt $attempt/$max_attempts: Provider status: $status"
+                sleep 10
+                ((attempt++))
+            done
+            
+            if [ "$status" != "Registered" ]; then
+                log_error "Provider $provider failed to register in time"
+                return 1
+            fi
+        else
+            log_info "$provider already registered"
+        fi
+    done
+    
+    log_success "All providers successfully registered"
+    return 0
+}
+
+################################################################################
+# Azure Resource Creation Functions
+################################################################################
+
+# Function to create Azure resources
 create_azure_resources() {
     print_section "Creating Azure Resources"
     
@@ -497,32 +518,17 @@ create_azure_resources() {
     kvResult=$(az keyvault create \
         --enable-rbac-authorization \
         --name "$AKV_NAME" \
-        --resource-group "$RESOURCE_GROUP" \
-        --location "$LOCATION" \
-        2>&1)
+        --resource-group "$RESOURCE_GROUP" 2>/dev/null)
     
     if [ $? -ne 0 ]; then
-        log_error "Failed to create Key Vault. Error details:"
-        log_error "$kvResult"
+        log_error "Failed to create Key Vault"
         return 1
     fi
     
     AKV_ID=$(echo "$kvResult" | jq -r '.id')
-    if [ -z "$AKV_ID" ] || [ "$AKV_ID" == "null" ]; then
+    if [ -z "$AKV_ID" ]; then
         log_error "Failed to get Key Vault ID"
         return 1
-    fi
-    
-    # Get current user's Object ID
-    local current_user_id
-    current_user_id=$(az ad signed-in-user show --query id -o tsv)
-    if [ -n "$current_user_id" ]; then
-        log_info "Assigning Key Vault Administrator role..."
-        az role assignment create \
-            --assignee "$current_user_id" \
-            --role "Key Vault Administrator" \
-            --scope "$AKV_ID" \
-            --only-show-errors || log_warning "Failed to assign Key Vault Administrator role"
     fi
     
     # Create Storage Account
@@ -530,9 +536,7 @@ create_azure_resources() {
     if ! az storage account create \
         --name "$STORAGE_NAME" \
         --resource-group "$RESOURCE_GROUP" \
-        --location "$LOCATION" \
-        --enable-hierarchical-namespace \
-        --only-show-errors; then
+        --enable-hierarchical-namespace; then
         log_error "Failed to create storage account"
         return 1
     fi
@@ -542,9 +546,10 @@ create_azure_resources() {
 }
 
 ################################################################################
-# Summary Functions
+# Summary and Configuration Functions
 ################################################################################
 
+# Function to print summary
 print_summary() {
     local end_time=$(date +%s)
     local total_time=$((end_time - SCRIPT_START_TIME))
@@ -567,7 +572,6 @@ print_summary() {
     echo "Total Execution Time: $total_time seconds"
     
     # Save configuration
-    log_info "Saving configuration to azure_config.env..."
     cat > azure_config.env << EOF
 export SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
 export LOCATION="$LOCATION"
@@ -636,7 +640,7 @@ main() {
 }
 
 ################################################################################
-# Script Entry Point
+# Script Execution
 ################################################################################
 
 # Ensure script is run with bash
