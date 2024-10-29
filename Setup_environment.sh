@@ -271,7 +271,7 @@ fi
 # Install all tools
 print_section "Installing Tools"
 sudo apt-get update
-TOOLS="code azure-cli git kubectl helm"
+TOOLS="code azure-cli git kubectl helm jq"
 for tool in $TOOLS; do
     if ! command_exists $tool; then
         sudo apt-get install -y $tool
