@@ -1,258 +1,316 @@
 #!/bin/bash
 
-# Color codes for pretty output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Color definitions for pretty output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
 
-# Function to print section headers
-print_section() {
-    echo -e "\n${BLUE}=== $1 ===${NC}"
+# Global variables for timing
+readonly SCRIPT_START_TIME=$(date +%s)
+declare -A ACTION_TIMES
+
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Function to measure execution time of actions
+time_action() {
+    local start_time=$(date +%s)
+    local action_name="$1"
+    shift
+    "$@"
+    local status=$?
+    local end_time=$(date +%s)
+    ACTION_TIMES["$action_name"]=$((end_time - start_time))
+    return $status
 }
 
-# Function to print success messages
-print_success() {
-    echo -e "${GREEN}✔ $1${NC}"
+# Function to format text (lowercase and remove spaces)
+format_text() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' '
 }
 
-# Function to print error messages
-print_error() {
-    echo -e "${RED}✖ $1${NC}"
-}
-
-# Function to print info messages
-print_info() {
-    echo -e "${YELLOW}ℹ $1${NC}"
-}
-
-# Function to validate and format resource names
-validate_name() {
-    local input=$1
-    local prefix=$2
-    local max_length=$3
-    
-    # Convert to lowercase and remove spaces
-    local formatted=$(echo "$input" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-    
-    # Ensure it starts with letter and contains only letters and numbers
-    if [[ ! $formatted =~ ^[a-z][a-z0-9]*$ ]]; then
-        print_error "Name must start with a letter and contain only letters and numbers"
-        return 1
-    fi
-    
-    # Check length including prefix
-    if [ ${#formatted} -gt $max_length ]; then
-        print_error "Name too long (max $max_length characters including prefix)"
-        return 1
-    fi
-    
-    echo "$formatted"
-    return 0
-}
-
-# Function to check if Azure CLI is logged in
+# Function to check Azure login status
 check_azure_login() {
-    if ! az account show >/dev/null 2>&1; then
-        print_info "Please log in to Azure..."
-        az login
-    fi
-}
-
-# Function to get available locations
-get_locations() {
-    az account list-locations --query "[].name" -o tsv
-}
-
-# Function to validate location
-validate_location() {
-    local location=$1
-    local locations=$(get_locations)
-    if [[ $locations == *"$location"* ]]; then
+    log_info "Checking Azure login status..."
+    if az account show &>/dev/null; then
+        log_success "Already logged into Azure"
         return 0
     else
-        return 1
+        log_info "Azure login required. Opening browser..."
+        time_action "Azure Login" az login || {
+            log_error "Azure login failed"
+            return 1
+        }
     fi
 }
 
-# Main script starts here
-print_section "Azure Resource Setup for LAB460"
-print_info "This script will help you set up Azure resources for Arc-enabled Kubernetes"
-
-# Check Azure CLI login
-check_azure_login
-
-# Get subscription ID
-print_section "Subscription Selection"
-az account list --query "[].{name:name, id:id}" -o table
-echo
-read -p "Enter your subscription ID: " SUBSCRIPTION_ID
-az account set --subscription $SUBSCRIPTION_ID
-
-# Get location
-print_section "Location Selection"
-print_info "Available locations:"
-az account list-locations --query "[].name" -o table
-echo
-while true; do
-    read -p "Enter the Azure location: " LOCATION
-    LOCATION=$(echo "$LOCATION" | tr '[:upper:]' '[:lower:]')
-    if validate_location "$LOCATION"; then
-        break
+# Function to check resource group existence and location
+check_resource_group() {
+    local rg="LAB460"
+    log_info "Checking for resource group $rg..."
+    
+    if az group show --name "$rg" &>/dev/null; then
+        LOCATION=$(az group show --name "$rg" --query location -o tsv)
+        log_success "Found existing resource group $rg in location: $LOCATION"
+        return 0
     else
-        print_error "Invalid location. Please choose from the list above."
+        log_warning "Resource group $rg not found"
+        get_location
+        log_info "Creating resource group $rg in $LOCATION..."
+        time_action "Create Resource Group" az group create --name "$rg" --location "$LOCATION" || {
+            log_error "Failed to create resource group"
+            return 1
+        }
     fi
-done
+}
 
-# Set resource group
-RESOURCE_GROUP="lab460"
-print_success "Using resource group: $RESOURCE_GROUP"
+# Function to get and validate location
+get_location() {
+    log_info "Available Azure locations:"
+    az account list-locations --query "[].name" -o table
+    
+    while true; do
+        read -p "Enter Azure location: " LOCATION
+        LOCATION=$(format_text "$LOCATION")
+        if az account list-locations --query "[?name=='$LOCATION']" --output tsv &>/dev/null; then
+            break
+        else
+            log_error "Invalid location. Please try again."
+        fi
+    done
+}
 
-# Get cluster name
-print_section "Cluster Configuration"
-while true; do
-    read -p "Enter the Arc-enabled cluster name: " CLUSTER_NAME
-    CLUSTER_NAME=$(validate_name "$CLUSTER_NAME" "" 63)
-    if [ $? -eq 0 ]; then
-        break
+# Function to get and validate subscription
+get_subscription() {
+    log_info "Available subscriptions:"
+    az account list --query "[].{Name:name, ID:id}" -o table
+    
+    while true; do
+        read -p "Enter Subscription ID: " SUBSCRIPTION_ID
+        if az account show --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
+            az account set --subscription "$SUBSCRIPTION_ID"
+            break
+        else
+            log_error "Invalid subscription ID. Please try again."
+        fi
+    done
+}
+
+# Function to get cluster name
+get_cluster_name() {
+    while true; do
+        read -p "Enter cluster name (lowercase, no spaces): " CLUSTER_NAME
+        CLUSTER_NAME=$(format_text "$CLUSTER_NAME")
+        if [[ $CLUSTER_NAME =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; then
+            break
+        else
+            log_error "Invalid cluster name. Use lowercase letters, numbers, and hyphens."
+        fi
+    done
+}
+
+# Function to get storage account name
+get_storage_name() {
+    while true; do
+        read -p "Enter storage account name (3-24 chars, lowercase letters and numbers): " STORAGE_NAME
+        STORAGE_NAME=$(format_text "${STORAGE_NAME}st")
+        if [[ $STORAGE_NAME =~ ^[a-z0-9]{3,24}$ ]]; then
+            break
+        else
+            log_error "Invalid storage account name."
+        fi
+    done
+}
+
+# Function to get key vault name
+get_keyvault_name() {
+    while true; do
+        read -p "Enter key vault name (3-24 chars, lowercase letters and numbers): " AKV_NAME
+        AKV_NAME=$(format_text "${AKV_NAME}akv")
+        if [[ $AKV_NAME =~ ^[a-z0-9-]{3,24}$ ]]; then
+            break
+        else
+            log_error "Invalid key vault name."
+        fi
+    done
+}
+
+# Function to register Azure providers
+register_providers() {
+    local providers=(
+        "Microsoft.ExtendedLocation"
+        "Microsoft.Kubernetes"
+        "Microsoft.KubernetesConfiguration"
+        "Microsoft.IoTOperations"
+        "Microsoft.DeviceRegistry"
+        "Microsoft.SecretSyncController"
+    )
+    
+    for provider in "${providers[@]}"; do
+        log_info "Registering provider: $provider"
+        if ! az provider show --namespace "$provider" --query "registrationState" -o tsv | grep -q "Registered"; then
+            time_action "Register $provider" az provider register -n "$provider" || {
+                log_error "Failed to register $provider"
+                return 1
+            }
+        else
+            log_info "$provider already registered"
+        fi
+    done
+}
+
+# Function to setup connectedk8s
+setup_connectedk8s() {
+    log_info "Setting up connected Kubernetes..."
+    
+    # Add extension if not present
+    if ! az extension show --name connectedk8s &>/dev/null; then
+        time_action "Add connectedk8s extension" az extension add --upgrade --name connectedk8s || {
+            log_error "Failed to add connectedk8s extension"
+            return 1
+        }
     fi
-done
+    
+    # Connect cluster
+    time_action "Connect Kubernetes cluster" az connectedk8s connect \
+        --name "$CLUSTER_NAME" \
+        -l "$LOCATION" \
+        --resource-group "LAB460" \
+        --subscription "$SUBSCRIPTION_ID" \
+        --enable-oidc-issuer \
+        --enable-workload-identity || {
+        log_error "Failed to connect Kubernetes cluster"
+        return 1
+    }
+    
+    # Get OIDC Issuer URL
+    ISSUER_URL_ID=$(az connectedk8s show \
+        --resource-group "LAB460" \
+        --name "$CLUSTER_NAME" \
+        --query oidcIssuerProfile.issuerUrl \
+        --output tsv)
+}
 
-# Get storage account name
-print_section "Storage Account Configuration"
-while true; do
-    read -p "Enter the storage account name (without 'st' suffix): " STORAGE_BASE
-    STORAGE_NAME="${STORAGE_BASE}st"
-    STORAGE_NAME=$(validate_name "$STORAGE_NAME" "" 24)
-    if [ $? -eq 0 ]; then
-        break
-    fi
-done
+# Function to configure k3s
+configure_k3s() {
+    log_info "Configuring k3s..."
+    {
+        echo "kube-apiserver-arg:"
+        echo " - service-account-issuer=$ISSUER_URL_ID"
+        echo " - service-account-max-token-expiration=24h"
+    } | sudo tee -a /etc/rancher/k3s/config.yaml > /dev/null
+    
+    # Get Object ID and enable features
+    OBJECT_ID=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)
+    
+    time_action "Enable cluster features" az connectedk8s enable-features \
+        -n "$CLUSTER_NAME" \
+        -g "LAB460" \
+        --custom-locations-oid "$OBJECT_ID" \
+        --features cluster-connect custom-locations || {
+        log_error "Failed to enable cluster features"
+        return 1
+    }
+    
+    time_action "Restart k3s" sudo systemctl restart k3s || {
+        log_error "Failed to restart k3s"
+        return 1
+    }
+}
 
-# Get Key Vault name
-print_section "Key Vault Configuration"
-while true; do
-    read -p "Enter the Key Vault name (without 'akv' suffix): " KV_BASE
-    AKV_NAME="${KV_BASE}akv"
-    AKV_NAME=$(validate_name "$AKV_NAME" "" 24)
-    if [ $? -eq 0 ]; then
-        break
-    fi
-done
+# Function to create Azure resources
+create_azure_resources() {
+    # Create Key Vault
+    log_info "Creating Key Vault..."
+    local kvResult=$(time_action "Create Key Vault" az keyvault create \
+        --enable-rbac-authorization \
+        --name "$AKV_NAME" \
+        --resource-group "LAB460")
+    AKV_ID=$(echo "$kvResult" | jq -r '.id')
+    
+    # Create Storage Account
+    log_info "Creating Storage Account..."
+    time_action "Create Storage Account" az storage account create \
+        --name "$STORAGE_NAME" \
+        --resource-group "LAB460" \
+        --enable-hierarchical-namespace || {
+        log_error "Failed to create storage account"
+        return 1
+    }
+}
 
-# Summary before execution
-print_section "Configuration Summary"
-echo "Subscription ID: $SUBSCRIPTION_ID"
-echo "Location: $LOCATION"
-echo "Resource Group: $RESOURCE_GROUP"
-echo "Cluster Name: $CLUSTER_NAME"
-echo "Storage Account: $STORAGE_NAME"
-echo "Key Vault: $AKV_NAME"
+# Function to print summary
+print_summary() {
+    local end_time=$(date +%s)
+    local total_time=$((end_time - SCRIPT_START_TIME))
+    
+    echo -e "\n${BLUE}=== Execution Summary ===${NC}"
+    echo -e "\n${GREEN}Configuration:${NC}"
+    echo "Resource Group: LAB460"
+    echo "Location: $LOCATION"
+    echo "Subscription ID: $SUBSCRIPTION_ID"
+    echo "Cluster Name: $CLUSTER_NAME"
+    echo "Storage Account: $STORAGE_NAME"
+    echo "Key Vault: $AKV_NAME"
+    echo "Key Vault ID: $AKV_ID"
+    
+    echo -e "\n${YELLOW}Execution Times:${NC}"
+    for action in "${!ACTION_TIMES[@]}"; do
+        printf "%-30s: %d seconds\n" "$action" "${ACTION_TIMES[$action]}"
+    done
+    echo "Total Execution Time: $total_time seconds"
+    
+    # Save configuration
+    cat > azure_config.env << EOF
+export SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
+export LOCATION="$LOCATION"
+export RESOURCE_GROUP="LAB460"
+export CLUSTER_NAME="$CLUSTER_NAME"
+export STORAGE_NAME="$STORAGE_NAME"
+export AKV_NAME="$AKV_NAME"
+export AKV_ID="$AKV_ID"
+export ISSUER_URL_ID="$ISSUER_URL_ID"
+EOF
+    log_success "Configuration saved to azure_config.env"
+}
 
-read -p "Press Enter to continue or Ctrl+C to cancel..."
+# Main execution flow
+main() {
+    log_info "Starting Azure setup script..."
+    
+    # Essential setup
+    check_azure_login || exit 1
+    check_resource_group || exit 1
+    get_subscription || exit 1
+    get_cluster_name || exit 1
+    get_storage_name || exit 1
+    get_keyvault_name || exit 1
+    
+    # Show configuration before proceeding
+    echo -e "\n${BLUE}=== Configuration to be applied ===${NC}"
+    echo "Resource Group: LAB460"
+    echo "Location: $LOCATION"
+    echo "Subscription ID: $SUBSCRIPTION_ID"
+    echo "Cluster Name: $CLUSTER_NAME"
+    echo "Storage Account: $STORAGE_NAME"
+    echo "Key Vault: $AKV_NAME"
+    
+    read -p "Press Enter to continue or Ctrl+C to cancel..."
+    
+    # Execute Azure operations
+    register_providers || exit 1
+    setup_connectedk8s || exit 1
+    configure_k3s || exit 1
+    create_azure_resources || exit 1
+    
+    # Print summary
+    print_summary
+}
 
-# Execute Azure commands
-print_section "Registering Azure Providers"
-PROVIDERS=(
-    "Microsoft.ExtendedLocation"
-    "Microsoft.Kubernetes"
-    "Microsoft.KubernetesConfiguration"
-    "Microsoft.IoTOperations"
-    "Microsoft.DeviceRegistry"
-    "Microsoft.SecretSyncController"
-)
-
-for provider in "${PROVIDERS[@]}"; do
-    print_info "Registering $provider..."
-    az provider register -n "$provider"
-done
-
-print_section "Installing Azure Extensions"
-print_info "Adding connectedk8s extension..."
-az extension add --upgrade --name connectedk8s
-
-# Create resource group if it doesn't exist
-print_section "Creating Resource Group"
-az group create --name $RESOURCE_GROUP --location $LOCATION
-
-# Connect the cluster
-print_section "Connecting Kubernetes Cluster"
-print_info "Connecting cluster to Azure Arc..."
-az connectedk8s connect \
-    --name $CLUSTER_NAME \
-    -l $LOCATION \
-    --resource-group $RESOURCE_GROUP \
-    --subscription $SUBSCRIPTION_ID \
-    --enable-oidc-issuer \
-    --enable-workload-identity
-
-# Get OIDC Issuer URL
-print_info "Getting OIDC Issuer URL..."
-export ISSUER_URL_ID=$(az connectedk8s show \
-    --resource-group $RESOURCE_GROUP \
-    --name $CLUSTER_NAME \
-    --query oidcIssuerProfile.issuerUrl \
-    --output tsv)
-
-print_section "Configuring K3s Service Account"
-# Update K3s configuration
-{
-    echo "kube-apiserver-arg:"
-    echo " - service-account-issuer=$ISSUER_URL_ID"
-    echo " - service-account-max-token-expiration=24h"
-} | sudo tee -a /etc/rancher/k3s/config.yaml > /dev/null
-
-# Enable features
-print_section "Enabling Arc Features"
-print_info "Getting Object ID..."
-export OBJECT_ID=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)
-
-print_info "Enabling cluster features..."
-az connectedk8s enable-features \
-    -n $CLUSTER_NAME \
-    -g $RESOURCE_GROUP \
-    --custom-locations-oid $OBJECT_ID \
-    --features cluster-connect custom-locations
-
-print_info "Restarting K3s..."
-sudo systemctl restart k3s
-
-# Create Key Vault
-print_section "Creating Key Vault"
-print_info "Creating Key Vault $AKV_NAME..."
-AKV_RESULT=$(az keyvault create \
-    --enable-rbac-authorization \
-    --name $AKV_NAME \
-    --resource-group $RESOURCE_GROUP)
-export AKV_ID=$(echo $AKV_RESULT | jq -r '.id')
-
-# Create Storage Account
-print_section "Creating Storage Account"
-print_info "Creating Storage Account $STORAGE_NAME..."
-az storage account create \
-    --name $STORAGE_NAME \
-    --resource-group $RESOURCE_GROUP \
-    --enable-hierarchical-namespace
-
-print_section "Setup Complete"
-print_success "Azure resources have been created successfully"
-print_info "Key Vault ID: $AKV_ID"
-print_info "Please save these values for future use"
-
-# Save variables to a file
-print_section "Saving Configuration"
-CONFIG_FILE="azure_config.env"
-{
-    echo "export SUBSCRIPTION_ID=\"$SUBSCRIPTION_ID\""
-    echo "export LOCATION=\"$LOCATION\""
-    echo "export RESOURCE_GROUP=\"$RESOURCE_GROUP\""
-    echo "export CLUSTER_NAME=\"$CLUSTER_NAME\""
-    echo "export STORAGE_NAME=\"$STORAGE_NAME\""
-    echo "export AKV_NAME=\"$AKV_NAME\""
-    echo "export AKV_ID=\"$AKV_ID\""
-    echo "export ISSUER_URL_ID=\"$ISSUER_URL_ID\""
-} > $CONFIG_FILE
-
-print_success "Configuration saved to $CONFIG_FILE"
-print_info "To load these variables in a new session, run: source $CONFIG_FILE"
+# Execute main function
+main
