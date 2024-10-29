@@ -74,32 +74,50 @@ check_azure_cli() {
 handle_azure_auth() {
     print_section "Azure Authentication"
     
-    print_info "Checking Azure login status..."
-    
-    # Get current subscription info
+    # First try az login directly to ensure browser opens if needed
+    az login
+    if [ $? -ne 0 ]; then
+        print_error "Azure login failed"
+        exit 1
+    fi
+
+    # Now get and validate subscription info
+    print_info "Checking Azure subscription..."
     local account_info
     account_info=$(az account show 2>/dev/null)
     if [ $? -eq 0 ]; then
-        # Already logged in, extract info
+        # Extract subscription info
         SUBSCRIPTION_ID=$(echo "$account_info" | jq -r .id)
         SUBSCRIPTION_NAME=$(echo "$account_info" | jq -r .name)
         TENANT_ID=$(echo "$account_info" | jq -r .tenantId)
         USER_NAME=$(echo "$account_info" | jq -r .user.name)
 
-        print_success "Already logged in to Azure"
+        if [[ -z "$SUBSCRIPTION_ID" || "$SUBSCRIPTION_ID" == "null" ]]; then
+            print_error "No subscription information found"
+            print_error "Please make sure you have an active subscription"
+            exit 1
+        fi
+
+        print_success "Successfully authenticated with Azure"
         print_info "Active Subscription Details:"
         print_info "Subscription Name   : $SUBSCRIPTION_NAME"
         print_info "Subscription ID     : $SUBSCRIPTION_ID"
         print_info "Tenant ID          : $TENANT_ID"
         print_info "User               : $USER_NAME"
 
+        # Ensure subscription is set as active
+        if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
+            print_error "Failed to set subscription as active"
+            exit 1
+        fi
+        print_success "Successfully set active subscription"
+
         export SUBSCRIPTION_ID
         return 0
+    else
+        print_error "Failed to get subscription information after login"
+        exit 1
     fi
-
-    # If we get here, we're not logged in
-    print_error "Not logged in to Azure"
-    exit 1
 }
 
 # Main script starts here
