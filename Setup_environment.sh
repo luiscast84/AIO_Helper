@@ -131,14 +131,31 @@ verify_and_load_environment() {
     
     # Load kubectl completion if available
     if command_exists kubectl; then
-        source <(kubectl completion bash)
-        print_success "Loaded kubectl completion"
+        # First ensure bash-completion is installed
+        if ! dpkg -l | grep -q bash-completion; then
+            sudo apt-get install -y bash-completion
+        fi
+        
+        # Add kubectl completion to bashrc if not already present
+        if ! grep -q "kubectl completion bash" ~/.bashrc; then
+            kubectl completion bash | sudo tee /etc/bash_completion.d/kubectl > /dev/null
+            echo 'source <(kubectl completion bash)' >>~/.bashrc
+            print_success "Added kubectl completion to ~/.bashrc"
+        else
+            print_info "kubectl completion already configured"
+        fi
     fi
     
     # Load Azure CLI completion if available
     if command_exists az; then
-        source <(az completion bash)
-        print_success "Loaded Azure CLI completion"
+        # Add az completion to bashrc if not already present
+        if ! grep -q "az completion bash" ~/.bashrc; then
+            az completion bash | sudo tee /etc/bash_completion.d/azure-cli > /dev/null
+            echo 'source <(az completion bash)' >>~/.bashrc
+            print_success "Added Azure CLI completion to ~/.bashrc"
+        else
+            print_info "Azure CLI completion already configured"
+        fi
     fi
     
     # Verify KUBECONFIG
