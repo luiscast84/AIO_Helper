@@ -271,6 +271,7 @@ install_kubectl() {
 }
 
 # Function to get resource names
+# Modified get_resource_names function to include name verification
 get_resource_names() {
     print_section "Getting Resource Names"
     
@@ -290,7 +291,12 @@ get_resource_names() {
         read -p "Enter storage account base name: " storage_base
         STORAGE_NAME=$(format_text "${storage_base}st")
         if [[ $STORAGE_NAME =~ ^[a-z0-9]{3,24}$ ]]; then
-            break
+            # Check if storage account name is available
+            if az storage account check-name --name "$STORAGE_NAME" --query "nameAvailable" -o tsv | grep -q "true"; then
+                break
+            else
+                log_error "Storage account name '$STORAGE_NAME' is not available. Please choose another name."
+            fi
         else
             log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
         fi
@@ -301,7 +307,12 @@ get_resource_names() {
         read -p "Enter key vault base name: " kv_base
         AKV_NAME=$(format_text "${kv_base}akv")
         if [[ $AKV_NAME =~ ^[a-z0-9-]{3,24}$ ]]; then
-            break
+            # Check if key vault name is available
+            if ! az keyvault name-exists --name "$AKV_NAME"; then
+                break
+            else
+                log_error "Key vault name '$AKV_NAME' is not available. Please choose another name."
+            fi
         else
             log_error "Invalid key vault name. Use 3-24 lowercase letters, numbers, and hyphens."
         fi
@@ -508,36 +519,94 @@ register_providers() {
 # Azure Resource Creation Functions
 ################################################################################
 
+# Function to verify key vault name availability
+verify_keyvault_name() {
+    local name=$1
+    log_info "Verifying Key Vault name availability..."
+    
+    # Check if name is available
+    if ! az keyvault name-exists --name "$name" &>/dev/null; then
+        return 0
+    else
+        log_error "Key Vault name '$name' is already in use"
+        return 1
+    fi
+}
+
 # Function to create Azure resources
 create_azure_resources() {
     print_section "Creating Azure Resources"
     
-    # Create Key Vault
+    # First verify Key Vault name availability
+    if ! verify_keyvault_name "$AKV_NAME"; then
+        log_error "Please choose a different Key Vault name"
+        return 1
+    fi
+    
+    # Get current user's Object ID for RBAC
+    local current_user_id
+    current_user_id=$(az ad signed-in-user show --query id -o tsv)
+    if [ -z "$current_user_id" ]; then
+        log_error "Failed to get current user's Object ID"
+        return 1
+    }
+    
+    # Create Key Vault with detailed error handling
     log_info "Creating Key Vault $AKV_NAME..."
     local kvResult
     kvResult=$(az keyvault create \
         --enable-rbac-authorization \
         --name "$AKV_NAME" \
-        --resource-group "$RESOURCE_GROUP" 2>/dev/null)
+        --resource-group "$RESOURCE_GROUP" \
+        --location "$LOCATION" \
+        2>&1)
     
     if [ $? -ne 0 ]; then
-        log_error "Failed to create Key Vault"
+        log_error "Failed to create Key Vault. Error details:"
+        log_error "$kvResult"
+        
+        # Check common issues
+        if echo "$kvResult" | grep -q "already exists"; then
+            log_error "A Key Vault with this name already exists. Please choose a different name."
+        elif echo "$kvResult" | grep -q "authorization"; then
+            log_error "You don't have sufficient permissions to create a Key Vault."
+            log_info "Required role: 'Key Vault Administrator' or 'Owner' on the resource group"
+        fi
         return 1
     fi
     
     AKV_ID=$(echo "$kvResult" | jq -r '.id')
-    if [ -z "$AKV_ID" ]; then
+    if [ -z "$AKV_ID" ] || [ "$AKV_ID" == "null" ]; then
         log_error "Failed to get Key Vault ID"
         return 1
     fi
     
+    # Assign RBAC roles to current user
+    log_info "Assigning RBAC roles to current user..."
+    if ! az role assignment create \
+        --assignee "$current_user_id" \
+        --role "Key Vault Administrator" \
+        --scope "$AKV_ID" \
+        --only-show-errors; then
+        log_warning "Failed to assign Key Vault Administrator role. You may need to assign it manually."
+    fi
+    
     # Create Storage Account
     log_info "Creating Storage Account $STORAGE_NAME..."
-    if ! az storage account create \
+    local stResult
+    stResult=$(az storage account create \
         --name "$STORAGE_NAME" \
         --resource-group "$RESOURCE_GROUP" \
-        --enable-hierarchical-namespace; then
-        log_error "Failed to create storage account"
+        --location "$LOCATION" \
+        --enable-hierarchical-namespace \
+        2>&1)
+    
+    if [ $? -ne 0 ]; then
+        log_error "Failed to create Storage Account. Error details:"
+        log_error "$stResult"
+        if echo "$stResult" | grep -q "already exists"; then
+            log_error "A Storage Account with this name already exists. Please choose a different name."
+        fi
         return 1
     fi
     
