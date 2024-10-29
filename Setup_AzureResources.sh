@@ -62,72 +62,83 @@ track_operation() {
     return $status
 }
 
-# Function to check Azure CLI installation
-check_azure_cli() {
-    if ! command -v az >/dev/null 2>&1; then
-        print_error "Azure CLI is not installed. Please install it first."
-        exit 1
-    fi
-}
-
 # Function to handle Azure authentication and subscription
 handle_azure_auth() {
     print_section "Azure Authentication"
     
-    # First try az login directly to ensure browser opens if needed
-    az login
-    if [ $? -ne 0 ]; then
-        print_error "Azure login failed"
-        exit 1
+    # Ensure DISPLAY is set for GUI applications
+    if [ -z "$DISPLAY" ]; then
+        export DISPLAY=:0
     fi
 
-    # Now get and validate subscription info
-    print_info "Checking Azure subscription..."
+    # First check if already logged in
+    print_info "Checking current Azure login status..."
     local account_info
     account_info=$(az account show 2>/dev/null)
-    if [ $? -eq 0 ]; then
-        # Extract subscription info
-        SUBSCRIPTION_ID=$(echo "$account_info" | jq -r .id)
-        SUBSCRIPTION_NAME=$(echo "$account_info" | jq -r .name)
-        TENANT_ID=$(echo "$account_info" | jq -r .tenantId)
-        USER_NAME=$(echo "$account_info" | jq -r .user.name)
-
-        if [[ -z "$SUBSCRIPTION_ID" || "$SUBSCRIPTION_ID" == "null" ]]; then
-            print_error "No subscription information found"
-            print_error "Please make sure you have an active subscription"
+    if [ $? -ne 0 ]; then
+        print_info "Not logged in. Starting Azure login process..."
+        print_info "Opening browser for authentication... (If browser doesn't open, run 'az login' manually)"
+        
+        if ! az login; then
+            print_error "Azure login failed"
+            print_info "Please try running 'az login' manually"
             exit 1
         fi
+        
+        # Get updated account info after login
+        account_info=$(az account show)
+    fi
 
-        print_success "Successfully authenticated with Azure"
-        print_info "Active Subscription Details:"
-        print_info "Subscription Name   : $SUBSCRIPTION_NAME"
-        print_info "Subscription ID     : $SUBSCRIPTION_ID"
-        print_info "Tenant ID          : $TENANT_ID"
-        print_info "User               : $USER_NAME"
+    # Verify subscription info
+    SUBSCRIPTION_ID=$(echo "$account_info" | jq -r .id)
+    SUBSCRIPTION_NAME=$(echo "$account_info" | jq -r .name)
+    TENANT_ID=$(echo "$account_info" | jq -r .tenantId)
+    USER_NAME=$(echo "$account_info" | jq -r .user.name)
 
-        # Ensure subscription is set as active
-        if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
-            print_error "Failed to set subscription as active"
-            exit 1
-        fi
-        print_success "Successfully set active subscription"
-
-        export SUBSCRIPTION_ID
-        return 0
-    else
-        print_error "Failed to get subscription information after login"
+    if [[ -z "$SUBSCRIPTION_ID" || "$SUBSCRIPTION_ID" == "null" ]]; then
+        print_error "No subscription information found"
+        print_error "Please make sure you have an active subscription"
         exit 1
     fi
+
+    print_success "Successfully authenticated with Azure"
+    print_info "Active Subscription Details:"
+    print_info "Subscription Name   : $SUBSCRIPTION_NAME"
+    print_info "Subscription ID     : $SUBSCRIPTION_ID"
+    print_info "Tenant ID          : $TENANT_ID"
+    print_info "User               : $USER_NAME"
+
+    # Ensure subscription is set as active
+    if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
+        print_error "Failed to set subscription as active"
+        exit 1
+    fi
+    print_success "Successfully set active subscription"
+    
+    export SUBSCRIPTION_ID
 }
 
 # Main script starts here
 print_section "Azure Arc Cluster Setup"
 print_info "Setting up Azure Arc environment in $LOCATION"
 
-# Check Azure CLI
-check_azure_cli
+# Check Azure CLI installation
+if ! command -v az >/dev/null 2>&1; then
+    print_error "Azure CLI is not installed. Please install it first."
+    exit 1
+fi
 
-# Handle Azure authentication and subscription
+# Check jq installation
+if ! command -v jq >/dev/null 2>&1; then
+    print_error "jq is not installed. Installing..."
+    sudo apt-get update && sudo apt-get install -y jq
+    if [ $? -ne 0 ]; then
+        print_error "Failed to install jq. Please install it manually."
+        exit 1
+    fi
+fi
+
+# Handle Azure authentication
 handle_azure_auth
 
 # Generate resource names (lowercase)
@@ -137,7 +148,6 @@ AKV_NAME="${RG_NAME,,}akv"
 
 # Show configuration
 print_section "Configuration"
-print_info "Subscription ID: $SUBSCRIPTION_ID"
 print_info "Resource Group: $RG_NAME"
 print_info "Location: $LOCATION"
 print_info "Cluster Name: $CLUSTER_NAME"
@@ -166,10 +176,7 @@ track_operation "Install connectedk8s extension" az extension add --upgrade --na
 
 # Create resource group
 print_section "Creating Resource Group"
-track_operation "Create Resource Group" az group create \
-    --name $RG_NAME \
-    --location $LOCATION \
-    --subscription $SUBSCRIPTION_ID
+track_operation "Create Resource Group" az group create --name $RG_NAME --location $LOCATION
 
 # Connect cluster to Arc
 print_section "Connecting Cluster to Arc"
