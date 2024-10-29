@@ -87,13 +87,39 @@ get_location() {
 
 # Function to get and validate subscription
 get_subscription() {
+    local current_sub=""
+    
+    # Try to get current subscription
+    if current_sub=$(az account show --query id -o tsv 2>/dev/null); then
+        log_info "Current subscription: $(az account show --query name -o tsv)"
+        log_info "Subscription ID: $current_sub"
+        
+        read -p "Would you like to use this subscription? (Y/n): " use_current
+        if [[ -z "$use_current" || "${use_current,,}" == "y"* ]]; then
+            SUBSCRIPTION_ID=$current_sub
+            log_success "Using current subscription: $SUBSCRIPTION_ID"
+            return 0
+        fi
+    fi
+
+    # If user wants to change or no subscription is set
     log_info "Available subscriptions:"
-    az account list --query "[].{Name:name, ID:id}" -o table
+    az account list --query "[].{Name:name, ID:id, State:state}" -o table
     
     while true; do
-        read -p "Enter Subscription ID: " SUBSCRIPTION_ID
+        read -p "Enter Subscription ID (or press Enter to cancel): " SUBSCRIPTION_ID
+        
+        # Allow user to cancel and keep current subscription
+        if [[ -z "$SUBSCRIPTION_ID" && -n "$current_sub" ]]; then
+            SUBSCRIPTION_ID=$current_sub
+            log_success "Keeping current subscription: $SUBSCRIPTION_ID"
+            return 0
+        fi
+        
+        # Validate and set the new subscription
         if az account show --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
             az account set --subscription "$SUBSCRIPTION_ID"
+            log_success "Switched to subscription: $SUBSCRIPTION_ID"
             break
         else
             log_error "Invalid subscription ID. Please try again."
@@ -154,7 +180,7 @@ register_providers() {
     for provider in "${providers[@]}"; do
         log_info "Registering provider: $provider"
         if ! az provider show --namespace "$provider" --query "registrationState" -o tsv | grep -q "Registered"; then
-            time_action "Register $provider" az provider register -n "$provider" || {
+            time_action "Register $provider" az provider register -n "$provider" --wait || {
                 log_error "Failed to register $provider"
                 return 1
             }
