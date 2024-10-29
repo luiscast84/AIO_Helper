@@ -7,6 +7,12 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Arrays to track installation status
+declare -A INSTALLED_PACKAGES=()
+declare -A SKIPPED_PACKAGES=()
+declare -A FAILED_PACKAGES=()
+declare -A SYSTEM_CHANGES=()
+
 # Function to print section headers
 print_section() {
     echo -e "\n${BLUE}=== $1 ===${NC}"
@@ -27,13 +33,18 @@ print_info() {
     echo -e "${YELLOW}ℹ $1${NC}"
 }
 
-# Function to check command status and exit if failed
+# Function to check command status and track results
 check_status() {
-    if [ $? -eq 0 ]; then
-        print_success "$1 completed successfully"
+    local command_name=$1
+    local status=$2
+    if [ $status -eq 0 ]; then
+        INSTALLED_PACKAGES[$command_name]="Installed successfully"
+        print_success "$command_name completed successfully"
+        return 0
     else
-        print_error "$1 failed"
-        exit 1
+        FAILED_PACKAGES[$command_name]="Installation failed"
+        print_error "$command_name failed"
+        return 1
     fi
 }
 
@@ -42,39 +53,150 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to check if a file contains a specific line
+file_contains() {
+    grep -Fxq "$1" "$2" 2>/dev/null
+}
+
+# Function to add a system change to tracking
+track_change() {
+    SYSTEM_CHANGES[$1]="$2"
+}
+
+# Function to check system requirements
+check_system_requirements() {
+    print_section "Checking System Requirements"
+    
+    local required_space=5120  # 5GB in MB
+    local available_space=$(df -m / | awk 'NR==2 {print $4}')
+    
+    if [ $available_space -lt $required_space ]; then
+        print_error "Insufficient disk space. Required: ${required_space}MB, Available: ${available_space}MB"
+        exit 1
+    fi
+    print_success "Disk space check passed"
+    
+    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        print_error "Script requires sudo privileges"
+        exit 1
+    fi
+    print_success "Privilege check passed"
+}
+
+# Function to print installation summary
+print_summary() {
+    print_section "Installation Summary"
+    
+    if [ ${#INSTALLED_PACKAGES[@]} -gt 0 ]; then
+        echo -e "${GREEN}Successfully Installed:${NC}"
+        for pkg in "${!INSTALLED_PACKAGES[@]}"; do
+            echo "  ✔ $pkg: ${INSTALLED_PACKAGES[$pkg]}"
+        done
+    fi
+    
+    if [ ${#SKIPPED_PACKAGES[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}Skipped (Already Installed):${NC}"
+        for pkg in "${!SKIPPED_PACKAGES[@]}"; do
+            echo "  ↷ $pkg: ${SKIPPED_PACKAGES[$pkg]}"
+        done
+    fi
+    
+    if [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
+        echo -e "\n${RED}Failed Installations:${NC}"
+        for pkg in "${!FAILED_PACKAGES[@]}"; do
+            echo "  ✖ $pkg: ${FAILED_PACKAGES[$pkg]}"
+        done
+    fi
+    
+    if [ ${#SYSTEM_CHANGES[@]} -gt 0 ]; then
+        echo -e "\n${BLUE}System Changes:${NC}"
+        for change in "${!SYSTEM_CHANGES[@]}"; do
+            echo "  • $change: ${SYSTEM_CHANGES[$change]}"
+        done
+    fi
+}
+
+# Function to verify and load environment
+verify_and_load_environment() {
+    print_section "Verifying and Loading Environment"
+    
+    # Verify PATH includes necessary directories
+    local dirs_to_check=("/usr/local/bin" "/usr/bin" "/usr/local/sbin")
+    for dir in "${dirs_to_check[@]}"; do
+        if [[ ":$PATH:" != *":$dir:"* ]]; then
+            export PATH="$PATH:$dir"
+            print_info "Added $dir to PATH"
+        fi
+    done
+    
+    # Load kubectl completion if available
+    if command_exists kubectl; then
+        source <(kubectl completion bash)
+        print_success "Loaded kubectl completion"
+    fi
+    
+    # Load Azure CLI completion if available
+    if command_exists az; then
+        source <(az completion bash)
+        print_success "Loaded Azure CLI completion"
+    fi
+    
+    # Verify KUBECONFIG
+    if [ -f ~/.kube/config ]; then
+        export KUBECONFIG=~/.kube/config
+        print_success "KUBECONFIG set to ~/.kube/config"
+    fi
+}
+
 # Main script starts here
-print_section "Starting Environment Setup"
-print_info "This script will set up your development environment with VS Code, Kubernetes (k3s), and Azure CLI"
+print_section "Starting Non-Interactive Environment Setup"
+print_info "Running in non-interactive mode with automatic yes to prompts"
+
+# Set non-interactive frontend for apt
+export DEBIAN_FRONTEND=noninteractive
+
+# Check system requirements
+check_system_requirements
 
 # System update
 print_section "Updating System Packages"
-sudo apt-get update && sudo apt-get dist-upgrade --assume-yes
-check_status "System update"
+if sudo apt-get update && sudo apt-get dist-upgrade -y; then
+    track_change "System Update" "Completed successfully"
+else
+    print_error "System update failed"
+    exit 1
+fi
 
 # Install basic dependencies
 print_section "Installing Basic Dependencies"
-print_info "Installing: wget, gpg, apt-transport-https, ca-certificates, curl, gnupg, lsb-release"
-sudo apt-get install -y wget gpg apt-transport-https ca-certificates curl gnupg lsb-release
-check_status "Dependencies installation"
+DEPS="wget gpg apt-transport-https ca-certificates curl gnupg lsb-release"
+for dep in $DEPS; do
+    if ! command_exists $dep; then
+        sudo apt-get install -y $dep
+        check_status $dep $?
+    else
+        SKIPPED_PACKAGES[$dep]="Already installed"
+        print_info "$dep already installed"
+    fi
+done
 
 # VS Code setup
 print_section "Setting up VS Code Repository"
 if ! command_exists code; then
-    print_info "Adding Microsoft VS Code repository"
     wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
     sudo install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
     echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | \
         sudo tee /etc/apt/sources.list.d/vscode.list > /dev/null
     rm -f packages.microsoft.gpg
-    check_status "VS Code repository setup"
+    track_change "VS Code Repository" "Added"
 else
-    print_info "VS Code is already installed"
+    SKIPPED_PACKAGES["VS Code"]="Already installed"
+    print_info "VS Code repository already configured"
 fi
 
 # Azure CLI setup
 print_section "Setting up Azure CLI Repository"
 if ! command_exists az; then
-    print_info "Adding Microsoft Azure CLI repository"
     sudo mkdir -p /etc/apt/keyrings
     curl -sLS https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/microsoft.gpg > /dev/null
     sudo chmod go+r /etc/apt/keyrings/microsoft.gpg
@@ -85,79 +207,104 @@ Suites: ${AZ_DIST}
 Components: main
 Architectures: $(dpkg --print-architecture)
 Signed-by: /etc/apt/keyrings/microsoft.gpg" | sudo tee /etc/apt/sources.list.d/azure-cli.sources
-    check_status "Azure CLI repository setup"
+    track_change "Azure CLI Repository" "Added"
 else
-    print_info "Azure CLI is already installed"
+    SKIPPED_PACKAGES["Azure CLI"]="Already installed"
+    print_info "Azure CLI repository already configured"
 fi
 
 # K3s setup
 print_section "Installing K3s"
 if ! command_exists k3s; then
-    print_info "Installing K3s"
-    curl -sfL https://get.k3s.io | sh -
-    check_status "K3s installation"
+    curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
+    check_status "K3s" $?
+    track_change "K3s Installation" "Completed"
 else
-    print_info "K3s is already installed"
+    SKIPPED_PACKAGES["K3s"]="Already installed"
+    print_info "K3s already installed"
 fi
 
 # Kubernetes tools setup
 print_section "Setting up Kubernetes Tools"
-print_info "Adding Kubernetes repository"
-sudo mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-sudo chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | \
-    sudo tee /etc/apt/sources.list.d/kubernetes.list
-sudo chmod 644 /etc/apt/sources.list.d/kubernetes.list
-check_status "Kubernetes repository setup"
+if ! command_exists kubectl; then
+    sudo mkdir -p -m 755 /etc/apt/keyrings
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    sudo chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | \
+        sudo tee /etc/apt/sources.list.d/kubernetes.list
+    sudo chmod 644 /etc/apt/sources.list.d/kubernetes.list
+    track_change "Kubernetes Repository" "Added"
+else
+    SKIPPED_PACKAGES["kubectl"]="Already installed"
+    print_info "Kubernetes tools already configured"
+fi
 
 # Helm setup
 print_section "Setting up Helm Repository"
-print_info "Adding Helm repository"
-curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | \
-    sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-check_status "Helm repository setup"
+if ! command_exists helm; then
+    curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | \
+        sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+    track_change "Helm Repository" "Added"
+else
+    SKIPPED_PACKAGES["Helm"]="Already installed"
+    print_info "Helm repository already configured"
+fi
 
 # Install all tools
 print_section "Installing Tools"
-print_info "Updating package lists"
 sudo apt-get update
-print_info "Installing VS Code, Azure CLI, Git, kubectl, and Helm"
-sudo apt-get install -y code azure-cli git kubectl helm
-check_status "Tools installation"
+TOOLS="code azure-cli git kubectl helm"
+for tool in $TOOLS; do
+    if ! command_exists $tool; then
+        sudo apt-get install -y $tool
+        check_status $tool $?
+    else
+        SKIPPED_PACKAGES[$tool]="Already installed"
+        print_info "$tool already installed"
+    fi
+done
 
 # Configure K3s
 print_section "Configuring K3s"
-print_info "Setting up Kubernetes configuration"
-mkdir -p ~/.kube
-sudo KUBECONFIG=~/.kube/config:/etc/rancher/k3s/k3s.yaml kubectl config view --flatten > ~/.kube/merged
-mv ~/.kube/merged ~/.kube/config
-chmod 0600 ~/.kube/config
-export KUBECONFIG=~/.kube/config
-kubectl config use-context default
-sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-check_status "K3s configuration"
+if [ ! -f ~/.kube/config ]; then
+    mkdir -p ~/.kube
+    sudo KUBECONFIG=~/.kube/config:/etc/rancher/k3s/k3s.yaml kubectl config view --flatten > ~/.kube/merged
+    mv ~/.kube/merged ~/.kube/config
+    chmod 0600 ~/.kube/config
+    export KUBECONFIG=~/.kube/config
+    kubectl config use-context default
+    track_change "K3s Configuration" "Created new config"
+else
+    print_info "K3s configuration already exists"
+    SKIPPED_PACKAGES["K3s config"]="Already configured"
+fi
 
 # Configure system settings
 print_section "Configuring System Settings"
-print_info "Setting up inotify limits"
-echo fs.inotify.max_user_instances=8192 | sudo tee -a /etc/sysctl.conf
-echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
-echo fs.file-max = 100000 | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
-check_status "System settings configuration"
+SYSCTL_SETTINGS=(
+    "fs.inotify.max_user_instances=8192"
+    "fs.inotify.max_user_watches=524288"
+    "fs.file-max=100000"
+)
 
-print_section "Installation Complete"
-print_success "Environment setup completed successfully"
-print_info "You may need to restart your terminal for all changes to take effect"
-
-# Final verification
-print_section "Verifying Installations"
-for cmd in code az kubectl helm k3s; do
-    if command_exists $cmd; then
-        print_success "$cmd is installed"
+for setting in "${SYSCTL_SETTINGS[@]}"; do
+    if ! file_contains "$setting" /etc/sysctl.conf; then
+        echo "$setting" | sudo tee -a /etc/sysctl.conf
+        track_change "System Setting" "Added $setting"
     else
-        print_error "$cmd installation could not be verified"
+        print_info "System setting $setting already configured"
     fi
 done
+sudo sysctl -p
+
+# Verify and load environment
+verify_and_load_environment
+
+# Print installation summary
+print_summary
+
+print_section "Final Steps"
+print_info "To complete the setup, please run:"
+echo "source ~/.bashrc"
+print_success "Environment setup completed successfully"
