@@ -4,13 +4,13 @@
 # Azure Arc Resource Setup Script
 #
 # This script automates the setup of Azure Arc-enabled Kubernetes cluster and
-# associated resources. It handles:
-# - Environment verification and setup
-# - Azure authentication and subscription management
-# - Resource group management
-# - Provider registration
-# - Kubernetes cluster configuration and Arc enablement
-# - Storage and Key Vault creation
+# associated resources, handling proper privilege management for each operation.
+#
+# Requirements:
+# - Run as a normal user (not root)
+# - Sudo privileges available for system operations
+# - Azure CLI installed
+# - kubectl and jq commands available
 ################################################################################
 
 # Color codes for pretty output
@@ -82,69 +82,47 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to check if a file contains a specific line
-file_contains() {
-    grep -Fxq "$1" "$2" 2>/dev/null
-}
-
-# Function to add a system change to tracking
-track_change() {
-    SYSTEM_CHANGES[$1]="$2"
-}
-
-# Function to check command status and track results
-check_status() {
-    local command_name=$1
-    local status=$2
-    if [ $status -eq 0 ]; then
-        INSTALLED_PACKAGES[$command_name]="Installed successfully"
-        log_success "$command_name completed successfully"
-        return 0
-    else
-        FAILED_PACKAGES[$command_name]="Installation failed"
-        log_error "$command_name failed"
-        return 1
-    fi
+# Function to check if running as root
+is_root() {
+    [ "$(id -u)" -eq 0 ]
 }
 
 ################################################################################
-# System Verification Functions
+# Privilege Management Functions
 ################################################################################
 
-# Function to check system requirements
-check_system_requirements() {
-    print_section "Checking System Requirements"
+# Function to check and store sudo credentials
+check_sudo_privileges() {
+    print_section "Checking Sudo Privileges"
     
-    # Check disk space (require 5GB free)
-    local required_space=5120  # 5GB in MB
-    local available_space=$(df -m / | awk 'NR==2 {print $4}')
+    # Prevent running as root
+    if is_root; then
+        log_error "Please run this script as a normal user (not root)"
+        log_info "The script will ask for sudo password when needed"
+        exit 1
+    }
     
-    if [ $available_space -lt $required_space ]; then
-        log_error "Insufficient disk space. Required: ${required_space}MB, Available: ${available_space}MB"
+    # Inform user about sudo requirements
+    log_info "This script requires sudo privileges for:"
+    echo "  - Installing system packages"
+    echo "  - Configuring k3s"
+    echo "  - Modifying system settings"
+    echo -e "\nOther operations like Azure login will run as current user"
+    
+    # Check if we can get sudo
+    if ! sudo -v; then
+        log_error "Unable to get sudo privileges"
         exit 1
     fi
-    log_success "Disk space check passed"
     
-    # Check sudo privileges
-    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
-        log_error "Script requires sudo privileges"
-        exit 1
-    fi
-    log_success "Privilege check passed"
-}
-
-# Function to verify environment paths
-verify_environment_paths() {
-    print_section "Verifying Environment Paths"
+    # Keep sudo alive in the background
+    (while true; do sudo -n true; sleep 50; kill -0 "$$" || exit; done 2>/dev/null) &
+    SUDO_KEEPER_PID=$!
     
-    # Check and add necessary directories to PATH
-    local dirs_to_check=("/usr/local/bin" "/usr/bin" "/usr/local/sbin")
-    for dir in "${dirs_to_check[@]}"; do
-        if [[ ":$PATH:" != *":$dir:"* ]]; then
-            export PATH="$PATH:$dir"
-            log_info "Added $dir to PATH"
-        fi
-    done
+    # Ensure we kill the sudo keeper on script exit
+    trap 'kill $SUDO_KEEPER_PID 2>/dev/null' EXIT
+    
+    log_success "Sudo privileges confirmed"
 }
 
 ################################################################################
@@ -155,21 +133,44 @@ verify_environment_paths() {
 check_azure_login() {
     print_section "Checking Azure Authentication"
     
+    # Check if az CLI is installed
+    if ! command -v az >/dev/null 2>&1; then
+        log_error "Azure CLI is not installed. Please install it first."
+        exit 1
+    }
+    
+    # Try to get current Azure login status
     if az account show &>/dev/null; then
-        log_success "Already logged into Azure"
-        return 0
-    else
-        log_info "Azure login required. Opening browser..."
-        time_action "Azure Login" az login || {
-            log_error "Azure login failed"
-            return 1
-        }
+        log_info "Current Azure login information:"
+        az account show --query "{Subscription:name,UserName:user.name,TenantID:tenantId}" -o table
+        
+        read -p "Continue with this Azure account? (Y/n): " use_current
+        if [[ -z "$use_current" || "${use_current,,}" == "y"* ]]; then
+            log_success "Using current Azure login"
+            return 0
+        fi
     fi
+    
+    # Need to login
+    log_info "Azure login required. Opening browser..."
+    if ! az login --use-device-code; then
+        log_error "Azure login failed"
+        return 1
+    fi
+    
+    # Show login information
+    log_info "Logged in successfully. Account information:"
+    az account show --query "{Subscription:name,UserName:user.name,TenantID:tenantId}" -o table
+    return 0
 }
+
+################################################################################
+# Subscription Management Functions
+################################################################################
 
 # Function to get and validate subscription
 get_subscription() {
-    local current_sub=""
+    print_section "Checking Subscription"
     
     # Try to get current subscription
     if current_sub=$(az account show --query id -o tsv 2>/dev/null); then
@@ -185,7 +186,6 @@ get_subscription() {
         
         while true; do
             read -p "Enter Subscription ID: " SUBSCRIPTION_ID
-            
             if az account show --subscription "$SUBSCRIPTION_ID" &>/dev/null; then
                 az account set --subscription "$SUBSCRIPTION_ID"
                 log_success "Switched to subscription: $SUBSCRIPTION_ID"
@@ -198,7 +198,7 @@ get_subscription() {
 }
 
 ################################################################################
-# Resource Management Functions
+# Resource Group Management Functions
 ################################################################################
 
 # Function to check resource group existence and location
@@ -215,10 +215,10 @@ check_resource_group() {
         log_warning "Resource group $RESOURCE_GROUP not found"
         get_location
         log_info "Creating resource group $RESOURCE_GROUP in $LOCATION..."
-        time_action "Create Resource Group" az group create --name "$RESOURCE_GROUP" --location "$LOCATION" || {
+        if ! az group create --name "$RESOURCE_GROUP" --location "$LOCATION"; then
             log_error "Failed to create resource group"
             return 1
-        }
+        fi
     fi
 }
 
@@ -241,75 +241,7 @@ get_location() {
 }
 
 ################################################################################
-# Azure Provider Registration Functions
-################################################################################
-
-# Function to wait for provider registration
-wait_for_provider_registration() {
-    local provider=$1
-    local max_attempts=30
-    local attempt=1
-    local wait_time=10
-
-    log_info "Waiting for $provider registration to complete..."
-    
-    while [ $attempt -le $max_attempts ]; do
-        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
-        
-        if [ "$status" == "Registered" ]; then
-            log_success "$provider registration completed"
-            return 0
-        fi
-        
-        log_info "Attempt $attempt/$max_attempts: $provider is in $status state. Waiting $wait_time seconds..."
-        sleep $wait_time
-        ((attempt++))
-    done
-
-    log_error "$provider registration did not complete in time"
-    return 1
-}
-
-# Function to register Azure providers
-register_providers() {
-    print_section "Registering Azure Providers"
-    
-    local providers=(
-        "Microsoft.ExtendedLocation"
-        "Microsoft.Kubernetes"
-        "Microsoft.KubernetesConfiguration"
-        "Microsoft.IoTOperations"
-        "Microsoft.DeviceRegistry"
-        "Microsoft.SecretSyncController"
-    )
-    
-    for provider in "${providers[@]}"; do
-        log_info "Checking provider: $provider"
-        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
-        
-        if [ "$status" != "Registered" ]; then
-            log_info "Registering provider: $provider"
-            if ! time_action "Register $provider" az provider register -n "$provider"; then
-                log_error "Failed to start registration for $provider"
-                return 1
-            fi
-            
-            # Wait for registration to complete
-            if ! wait_for_provider_registration "$provider"; then
-                log_error "Failed to register $provider"
-                return 1
-            fi
-        else
-            log_info "$provider already registered"
-        fi
-    done
-    
-    log_success "All providers successfully registered"
-    return 0
-}
-
-################################################################################
-# Kubernetes Setup and Configuration Functions
+# Kubernetes Setup Functions
 ################################################################################
 
 # Function to install kubectl
@@ -322,7 +254,7 @@ install_kubectl() {
         sudo apt-get remove -y kubectl &>/dev/null
     fi
     
-    # Add Google's apt repository and key
+    # Add Kubernetes repository and key
     log_info "Adding Kubernetes repository..."
     sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
     echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | \
@@ -339,15 +271,104 @@ install_kubectl() {
         return 1
     fi
     
-    # Verify kubectl can run
-    if ! kubectl version --client &>/dev/null; then
-        log_error "kubectl verification failed"
-        return 1
-    fi
-    
     log_success "kubectl installed successfully"
     return 0
 }
+
+# Function to verify kubeconfig
+verify_kubeconfig() {
+    print_section "Verifying Kubernetes Configuration"
+    
+    # Check if k3s is running
+    if ! systemctl is-active --quiet k3s; then
+        log_info "K3s service not running. Starting k3s..."
+        sudo systemctl start k3s
+        sleep 10  # Wait for k3s to start
+    fi
+    
+    # Ensure k3s.yaml exists
+    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+        log_error "k3s configuration file not found at /etc/rancher/k3s/k3s.yaml"
+        return 1
+    fi
+    
+    # Set up kubeconfig
+    mkdir -p ~/.kube
+    sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+    sudo chown $(id -u):$(id -g) ~/.kube/config
+    chmod 600 ~/.kube/config
+    export KUBECONFIG=~/.kube/config
+    
+    # Verify kubectl can connect
+    if ! kubectl cluster-info &>/dev/null; then
+        log_error "Unable to connect to Kubernetes cluster"
+        return 1
+    fi
+    
+    log_success "Kubernetes configuration verified successfully"
+    return 0
+}
+
+# Function to setup connected kubernetes
+setup_connectedk8s() {
+    print_section "Setting up Connected Kubernetes"
+    
+    # Verify kubectl installation
+    if ! command -v kubectl &>/dev/null; then
+        log_info "kubectl not found, installing..."
+        if ! install_kubectl; then
+            log_error "Failed to install kubectl"
+            return 1
+        fi
+    fi
+    
+    # Verify kubeconfig
+    if ! verify_kubeconfig; then
+        log_error "Failed to verify Kubernetes configuration"
+        return 1
+    fi
+    
+    # Add extension if not present
+    if ! az extension show --name connectedk8s &>/dev/null; then
+        log_info "Adding connectedk8s extension..."
+        if ! az extension add --upgrade --name connectedk8s; then
+            log_error "Failed to add connectedk8s extension"
+            return 1
+        fi
+    fi
+    
+    # Connect cluster
+    log_info "Connecting cluster to Azure Arc..."
+    if ! az connectedk8s connect \
+        --name "$CLUSTER_NAME" \
+        -l "$LOCATION" \
+        --resource-group "$RESOURCE_GROUP" \
+        --subscription "$SUBSCRIPTION_ID" \
+        --enable-oidc-issuer \
+        --enable-workload-identity; then
+        log_error "Failed to connect Kubernetes cluster"
+        return 1
+    fi
+    
+    # Get OIDC Issuer URL
+    ISSUER_URL_ID=$(az connectedk8s show \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$CLUSTER_NAME" \
+        --query oidcIssuerProfile.issuerUrl \
+        --output tsv)
+    
+    if [ -z "$ISSUER_URL_ID" ]; then
+        log_error "Failed to get OIDC Issuer URL"
+        return 1
+    fi
+    
+    log_success "Successfully connected to Azure Arc"
+    return 0
+}
+
+################################################################################
+# Resource Name Management Functions
+################################################################################
 
 # Function to get resource names
 get_resource_names() {
@@ -387,113 +408,73 @@ get_resource_names() {
     done
 }
 
-# Function to verify kubeconfig setup
-verify_kubeconfig() {
-    print_section "Verifying Kubernetes Configuration"
+################################################################################
+# Azure Provider Registration Functions
+################################################################################
+
+# Function to register Azure providers
+register_providers() {
+    print_section "Registering Azure Providers"
     
-    # Check if k3s is running
-    if ! systemctl is-active --quiet k3s; then
-        log_info "K3s service not running. Starting k3s..."
-        sudo systemctl start k3s
-        sleep 10  # Wait for k3s to start
-    fi
+    local providers=(
+        "Microsoft.ExtendedLocation"
+        "Microsoft.Kubernetes"
+        "Microsoft.KubernetesConfiguration"
+        "Microsoft.IoTOperations"
+        "Microsoft.DeviceRegistry"
+        "Microsoft.SecretSyncController"
+    )
     
-    # Ensure k3s.yaml exists
-    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
-        log_error "k3s configuration file not found at /etc/rancher/k3s/k3s.yaml"
-        return 1
-    fi
+    for provider in "${providers[@]}"; do
+        log_info "Checking provider: $provider"
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
+        
+        if [ "$status" != "Registered" ]; then
+            log_info "Registering provider: $provider"
+            if ! az provider register -n "$provider"; then
+                log_error "Failed to register $provider"
+                return 1
+            fi
+            
+            # Wait for registration
+            log_info "Waiting for $provider registration..."
+            while true; do
+                status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+                if [ "$status" == "Registered" ]; then
+                    break
+                fi
+                log_info "Provider status: $status. Waiting..."
+                sleep 10
+            done
+        else
+            log_info "$provider already registered"
+        fi
+    done
     
-    # Create .kube directory if it doesn't exist
-    mkdir -p ~/.kube
-    
-    # Copy and set proper permissions for kubeconfig
-    log_info "Setting up kubeconfig..."
-    sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
-    sudo chown $(id -u):$(id -g) ~/.kube/config
-    chmod 600 ~/.kube/config
-    
-    # Set KUBECONFIG environment variable
-    export KUBECONFIG=~/.kube/config
-    
-    # Verify kubectl can connect
-    if ! kubectl cluster-info &>/dev/null; then
-        log_error "Unable to connect to Kubernetes cluster"
-        return 1
-    fi
-    
-    log_success "Kubernetes configuration verified successfully"
+    log_success "All providers successfully registered"
     return 0
 }
 
-# Function to setup connected kubernetes
-setup_connectedk8s() {
-    print_section "Setting up Connected Kubernetes"
-    
-    # Install kubectl if not present
-    if ! command -v kubectl &>/dev/null; then
-        if ! install_kubectl; then
-            log_error "Failed to install kubectl"
-            return 1
-        fi
-    fi
-    
-    # Verify kubeconfig
-    if ! verify_kubeconfig; then
-        log_error "Failed to verify Kubernetes configuration"
-        return 1
-    fi
-    
-    # Add extension if not present
-    if ! az extension show --name connectedk8s &>/dev/null; then
-        time_action "Add connectedk8s extension" az extension add --upgrade --name connectedk8s || {
-            log_error "Failed to add connectedk8s extension"
-            return 1
-        }
-    fi
-    
-    # Connect cluster
-    log_info "Connecting cluster to Azure Arc..."
-    time_action "Connect Kubernetes cluster" az connectedk8s connect \
-        --name "$CLUSTER_NAME" \
-        -l "$LOCATION" \
-        --resource-group "$RESOURCE_GROUP" \
-        --subscription "$SUBSCRIPTION_ID" \
-        --enable-oidc-issuer \
-        --enable-workload-identity || {
-        log_error "Failed to connect Kubernetes cluster"
-        log_info "Checking cluster status..."
-        kubectl cluster-info
-        return 1
-    }
-    
-    # Get OIDC Issuer URL
-    ISSUER_URL_ID=$(az connectedk8s show \
-        --resource-group "$RESOURCE_GROUP" \
-        --name "$CLUSTER_NAME" \
-        --query oidcIssuerProfile.issuerUrl \
-        --output tsv)
-        
-    if [ -z "$ISSUER_URL_ID" ]; then
-        log_error "Failed to get OIDC Issuer URL"
-        return 1
-    fi
-    
-    log_success "Successfully connected to Azure Arc"
-    return 0
-}
+################################################################################
+# K3s Configuration Functions
+################################################################################
 
 # Function to configure k3s
 configure_k3s() {
     print_section "Configuring k3s"
     
-    # Check if OIDC URL is available
     if [ -z "$ISSUER_URL_ID" ]; then
         log_error "OIDC Issuer URL not available"
         return 1
     fi
     
-    # Create k3s configuration
+    # Backup existing config if it exists
+    if [ -f /etc/rancher/k3s/config.yaml ]; then
+        sudo cp /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.bak
+        log_info "Backed up existing k3s configuration"
+    fi
+    
+    # Update k3s configuration
     log_info "Updating k3s configuration..."
     {
         echo "kube-apiserver-arg:"
@@ -501,7 +482,7 @@ configure_k3s() {
         echo " - service-account-max-token-expiration=24h"
     } | sudo tee /etc/rancher/k3s/config.yaml > /dev/null
     
-    # Restart k3s and wait for it to be ready
+    # Restart k3s
     log_info "Restarting k3s..."
     sudo systemctl restart k3s
     sleep 10
@@ -539,8 +520,8 @@ create_azure_resources() {
     
     # Create Key Vault
     log_info "Creating Key Vault $AKV_NAME..."
-    local kvResult=""
-    kvResult=$(time_action "Create Key Vault" az keyvault create \
+    local kvResult
+    kvResult=$(az keyvault create \
         --enable-rbac-authorization \
         --name "$AKV_NAME" \
         --resource-group "$RESOURCE_GROUP" 2>/dev/null)
@@ -558,7 +539,7 @@ create_azure_resources() {
     
     # Create Storage Account
     log_info "Creating Storage Account $STORAGE_NAME..."
-    if ! time_action "Create Storage Account" az storage account create \
+    if ! az storage account create \
         --name "$STORAGE_NAME" \
         --resource-group "$RESOURCE_GROUP" \
         --enable-hierarchical-namespace; then
@@ -574,7 +555,7 @@ create_azure_resources() {
 # Summary and Configuration Functions
 ################################################################################
 
-# Function to print execution summary
+# Function to print summary
 print_summary() {
     local end_time=$(date +%s)
     local total_time=$((end_time - SCRIPT_START_TIME))
@@ -597,7 +578,6 @@ print_summary() {
     echo "Total Execution Time: $total_time seconds"
     
     # Save configuration
-    log_info "Saving configuration to azure_config.env..."
     cat > azure_config.env << EOF
 export SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
 export LOCATION="$LOCATION"
@@ -612,17 +592,23 @@ EOF
 }
 
 ################################################################################
-# Main Execution Function
+# Main Execution
 ################################################################################
 
 main() {
     log_info "Starting Azure setup script..."
     
-    # Essential setup and verification
-    check_system_requirements || exit 1
-    verify_environment_paths || exit 1
+    # Check if running as root
+    if is_root; then
+        log_error "Please run this script as a normal user (not root)"
+        log_info "The script will ask for sudo password when needed"
+        exit 1
+    fi
     
-    # Azure authentication and setup
+    # Get sudo privileges early but don't use them yet
+    check_sudo_privileges || exit 1
+    
+    # Azure authentication (as normal user)
     check_azure_login || exit 1
     get_subscription || exit 1
     check_resource_group || exit 1
@@ -639,37 +625,18 @@ main() {
     
     read -p "Press Enter to continue or Ctrl+C to cancel..."
     
-    # Execute Azure operations with progress tracking
-    local start_step=1
-    local total_steps=4
+    # Execute operations with appropriate privileges
+    log_info "Step 1/4: Registering Azure providers"
+    register_providers || exit 1
     
-    # Step 1: Register providers
-    log_info "Step $start_step/$total_steps: Registering Azure providers"
-    if ! register_providers; then
-        log_error "Provider registration failed"
-        exit 1
-    fi
+    log_info "Step 2/4: Setting up connected Kubernetes"
+    setup_connectedk8s || exit 1
     
-    # Step 2: Setup connected kubernetes
-    log_info "Step $((start_step + 1))/$total_steps: Setting up connected Kubernetes"
-    if ! setup_connectedk8s; then
-        log_error "Kubernetes setup failed"
-        exit 1
-    fi
+    log_info "Step 3/4: Configuring k3s"
+    configure_k3s || exit 1
     
-    # Step 3: Configure k3s
-    log_info "Step $((start_step + 2))/$total_steps: Configuring k3s"
-    if ! configure_k3s; then
-        log_error "k3s configuration failed"
-        exit 1
-    fi
-    
-    # Step 4: Create Azure resources
-    log_info "Step $((start_step + 3))/$total_steps: Creating Azure resources"
-    if ! create_azure_resources; then
-        log_error "Resource creation failed"
-        exit 1
-    fi
+    log_info "Step 4/4: Creating Azure resources"
+    create_azure_resources || exit 1
     
     # Print summary
     print_summary
