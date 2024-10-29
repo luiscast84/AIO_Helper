@@ -73,65 +73,59 @@ check_azure_cli() {
 # Function to handle Azure authentication and subscription
 handle_azure_auth() {
     print_section "Azure Authentication"
+    
+    # Check if Azure CLI is installed
+    if ! command -v az >/dev/null 2>&1; then
+        print_error "Azure CLI is not installed. Please install it first."
+        exit 1
+    fi
 
-    # Try to get current login status
-    local login_check=$(az account show 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        print_info "Not logged in to Azure. Starting login process..."
-        print_info "A browser window will open for authentication."
-        print_info "Please complete the login process in your browser."
-        
-        # Attempt login
-        if ! az login --use-device-code; then
-            print_error "Azure login failed. Please try again."
-            exit 1
-        fi
-        
-        # Verify login was successful
-        login_check=$(az account show 2>/dev/null)
+    # Check if jq is installed
+    if ! command -v jq >/dev/null 2>&1; then
+        print_error "jq is not installed. Installing..."
+        sudo apt-get update && sudo apt-get install -y jq
         if [ $? -ne 0 ]; then
-            print_error "Failed to verify Azure login. Please try again."
+            print_error "Failed to install jq. Please install it manually."
             exit 1
         fi
     fi
 
-    # Extract subscription information
-    local sub_id=$(echo $login_check | jq -r .id)
-    local sub_name=$(echo $login_check | jq -r .name)
-    local tenant_id=$(echo $login_check | jq -r .tenantId)
-    local user_name=$(echo $login_check | jq -r .user.name)
+    # Try to get subscription info first
+    print_info "Checking Azure login status..."
+    local login_check=$(az account show 2>/dev/null)
+    
+    # If not logged in or no subscription, trigger login
+    if [ $? -ne 0 ]; then
+        print_info "Not logged in. Starting Azure login..."
+        login_check=$(az login 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            print_error "Azure login failed"
+            exit 1
+        fi
+    fi
 
+    # Get current subscription info
+    local sub_id=$(echo "$login_check" | jq -r .id 2>/dev/null)
+    local sub_name=$(echo "$login_check" | jq -r .name 2>/dev/null)
+    local tenant_id=$(echo "$login_check" | jq -r .tenantId 2>/dev/null)
+    local user_name=$(echo "$login_check" | jq -r .user.name 2>/dev/null)
+
+    # Verify we got valid subscription info
     if [[ -z "$sub_id" || "$sub_id" == "null" ]]; then
-        print_error "Failed to get subscription information"
-        print_info "Please make sure you have an active subscription"
+        print_error "No subscription found. Please make sure you have an active subscription"
         exit 1
     fi
 
-    # Display current session information
-    print_success "Successfully logged in to Azure"
-    print_info "Current Context:"
-    print_info "User      : $user_name"
+    # Display subscription information
+    print_success "Successfully authenticated with Azure"
+    print_info "Active Subscription Details:"
+    print_info "Name      : $sub_name"
+    print_info "ID        : $sub_id"
     print_info "Tenant    : $tenant_id"
-    print_info "Sub Name  : $sub_name"
-    print_info "Sub ID    : $sub_id"
-
-    # Set subscription as active
-    if ! az account set --subscription "$sub_id"; then
-        print_error "Failed to set subscription as active"
-        exit 1
-    fi
-    print_success "Successfully set active subscription"
+    print_info "User      : $user_name"
 
     # Export subscription ID for use in script
     export SUBSCRIPTION_ID="$sub_id"
-    
-    # Verify permissions
-    print_info "Verifying permissions..."
-    if ! az group list --query "[?name=='$RG_NAME']" >/dev/null 2>&1; then
-        print_error "Failed to verify permissions. Please ensure you have sufficient permissions in this subscription."
-        exit 1
-    fi
-    print_success "Permission check passed"
 }
 
 # Main script starts here
