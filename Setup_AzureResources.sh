@@ -1,5 +1,19 @@
 #!/bin/bash
 
+################################################################################
+# Azure Resource Setup Script
+# 
+# This script automates the setup of Azure resources for Arc-enabled Kubernetes.
+# It handles:
+# - Azure login and subscription management
+# - Resource group verification/creation
+# - Provider registration
+# - Kubernetes cluster connection
+# - Storage and Key Vault creation
+#
+# The script includes timing, error handling, and status reporting.
+################################################################################
+
 # Color definitions for pretty output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -7,15 +21,20 @@ readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
 
-# Global variables for timing
+# Global variables
 readonly SCRIPT_START_TIME=$(date +%s)
 declare -A ACTION_TIMES
+readonly RESOURCE_GROUP="LAB460"  # Fixed resource group name
 
 # Logging functions
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+################################################################################
+# Utility Functions
+################################################################################
 
 # Function to measure execution time of actions
 time_action() {
@@ -34,6 +53,10 @@ format_text() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' '
 }
 
+################################################################################
+# Azure Authentication and Setup Functions
+################################################################################
+
 # Function to check Azure login status
 check_azure_login() {
     log_info "Checking Azure login status..."
@@ -47,42 +70,6 @@ check_azure_login() {
             return 1
         }
     fi
-}
-
-# Function to check resource group existence and location
-check_resource_group() {
-    local rg="LAB460"
-    log_info "Checking for resource group $rg..."
-    
-    if az group show --name "$rg" &>/dev/null; then
-        LOCATION=$(az group show --name "$rg" --query location -o tsv)
-        log_success "Found existing resource group $rg in location: $LOCATION"
-        return 0
-    else
-        log_warning "Resource group $rg not found"
-        get_location
-        log_info "Creating resource group $rg in $LOCATION..."
-        time_action "Create Resource Group" az group create --name "$rg" --location "$LOCATION" || {
-            log_error "Failed to create resource group"
-            return 1
-        }
-    fi
-}
-
-# Function to get and validate location
-get_location() {
-    log_info "Available Azure locations:"
-    az account list-locations --query "[].name" -o table
-    
-    while true; do
-        read -p "Enter Azure location: " LOCATION
-        LOCATION=$(format_text "$LOCATION")
-        if az account list-locations --query "[?name=='$LOCATION']" --output tsv &>/dev/null; then
-            break
-        else
-            log_error "Invalid location. Please try again."
-        fi
-    done
 }
 
 # Function to get and validate subscription
@@ -127,6 +114,49 @@ get_subscription() {
     done
 }
 
+################################################################################
+# Resource Group and Location Management
+################################################################################
+
+# Function to check resource group existence and location
+check_resource_group() {
+    log_info "Checking for resource group $RESOURCE_GROUP..."
+    
+    if az group show --name "$RESOURCE_GROUP" &>/dev/null; then
+        LOCATION=$(az group show --name "$RESOURCE_GROUP" --query location -o tsv)
+        log_success "Found existing resource group $RESOURCE_GROUP in location: $LOCATION"
+        return 0
+    else
+        log_warning "Resource group $RESOURCE_GROUP not found"
+        get_location
+        log_info "Creating resource group $RESOURCE_GROUP in $LOCATION..."
+        time_action "Create Resource Group" az group create --name "$RESOURCE_GROUP" --location "$LOCATION" || {
+            log_error "Failed to create resource group"
+            return 1
+        }
+    fi
+}
+
+# Function to get and validate location
+get_location() {
+    log_info "Available Azure locations:"
+    az account list-locations --query "[].name" -o table
+    
+    while true; do
+        read -p "Enter Azure location: " LOCATION
+        LOCATION=$(format_text "$LOCATION")
+        if az account list-locations --query "[?name=='$LOCATION']" --output tsv &>/dev/null; then
+            break
+        else
+            log_error "Invalid location. Please try again."
+        fi
+    done
+}
+
+################################################################################
+# Resource Name Input Functions
+################################################################################
+
 # Function to get cluster name
 get_cluster_name() {
     while true; do
@@ -166,6 +196,36 @@ get_keyvault_name() {
     done
 }
 
+################################################################################
+# Azure Provider Registration Functions
+################################################################################
+
+# Function to wait for provider registration
+wait_for_provider_registration() {
+    local provider=$1
+    local max_attempts=30
+    local attempt=1
+    local wait_time=10
+
+    log_info "Waiting for $provider registration to complete..."
+    
+    while [ $attempt -le $max_attempts ]; do
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+        
+        if [ "$status" == "Registered" ]; then
+            log_success "$provider registration completed"
+            return 0
+        fi
+        
+        log_info "Attempt $attempt/$max_attempts: $provider is in $status state. Waiting $wait_time seconds..."
+        sleep $wait_time
+        ((attempt++))
+    done
+
+    log_error "$provider registration did not complete in time"
+    return 1
+}
+
 # Function to register Azure providers
 register_providers() {
     local providers=(
@@ -178,21 +238,69 @@ register_providers() {
     )
     
     for provider in "${providers[@]}"; do
-        log_info "Registering provider: $provider"
-        if ! az provider show --namespace "$provider" --query "registrationState" -o tsv | grep -q "Registered"; then
-            time_action "Register $provider" az provider register -n "$provider" --wait || {
+        log_info "Checking provider: $provider"
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
+        
+        if [ "$status" != "Registered" ]; then
+            log_info "Registering provider: $provider"
+            if ! time_action "Register $provider" az provider register -n "$provider"; then
+                log_error "Failed to start registration for $provider"
+                return 1
+            fi
+            
+            # Wait for registration to complete
+            if ! wait_for_provider_registration "$provider"; then
                 log_error "Failed to register $provider"
                 return 1
-            }
+            fi
         else
             log_info "$provider already registered"
         fi
     done
+    
+    # Double-check all providers are registered
+    local all_registered=true
+    for provider in "${providers[@]}"; do
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+        if [ "$status" != "Registered" ]; then
+            log_error "$provider is not fully registered (status: $status)"
+            all_registered=false
+        fi
+    done
+    
+    if [ "$all_registered" = false ]; then
+        log_error "Not all providers are fully registered. Please try running the script again."
+        return 1
+    fi
+    
+    log_success "All providers successfully registered"
+    return 0
 }
+
+################################################################################
+# Kubernetes Setup Functions
+################################################################################
 
 # Function to setup connectedk8s
 setup_connectedk8s() {
     log_info "Setting up connected Kubernetes..."
+    
+    # Verify all required providers are registered first
+    log_info "Verifying provider registration status..."
+    local required_providers=(
+        "Microsoft.Kubernetes"
+        "Microsoft.KubernetesConfiguration"
+        "Microsoft.ExtendedLocation"
+    )
+    
+    for provider in "${required_providers[@]}"; do
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+        if [ "$status" != "Registered" ]; then
+            log_error "$provider is not fully registered (status: $status)"
+            log_info "Please wait a few minutes and try again"
+            return 1
+        fi
+    done
     
     # Add extension if not present
     if ! az extension show --name connectedk8s &>/dev/null; then
@@ -206,7 +314,7 @@ setup_connectedk8s() {
     time_action "Connect Kubernetes cluster" az connectedk8s connect \
         --name "$CLUSTER_NAME" \
         -l "$LOCATION" \
-        --resource-group "LAB460" \
+        --resource-group "$RESOURCE_GROUP" \
         --subscription "$SUBSCRIPTION_ID" \
         --enable-oidc-issuer \
         --enable-workload-identity || {
@@ -216,7 +324,7 @@ setup_connectedk8s() {
     
     # Get OIDC Issuer URL
     ISSUER_URL_ID=$(az connectedk8s show \
-        --resource-group "LAB460" \
+        --resource-group "$RESOURCE_GROUP" \
         --name "$CLUSTER_NAME" \
         --query oidcIssuerProfile.issuerUrl \
         --output tsv)
@@ -236,7 +344,7 @@ configure_k3s() {
     
     time_action "Enable cluster features" az connectedk8s enable-features \
         -n "$CLUSTER_NAME" \
-        -g "LAB460" \
+        -g "$RESOURCE_GROUP" \
         --custom-locations-oid "$OBJECT_ID" \
         --features cluster-connect custom-locations || {
         log_error "Failed to enable cluster features"
@@ -249,6 +357,10 @@ configure_k3s() {
     }
 }
 
+################################################################################
+# Azure Resource Creation Functions
+################################################################################
+
 # Function to create Azure resources
 create_azure_resources() {
     # Create Key Vault
@@ -256,19 +368,23 @@ create_azure_resources() {
     local kvResult=$(time_action "Create Key Vault" az keyvault create \
         --enable-rbac-authorization \
         --name "$AKV_NAME" \
-        --resource-group "LAB460")
+        --resource-group "$RESOURCE_GROUP")
     AKV_ID=$(echo "$kvResult" | jq -r '.id')
     
     # Create Storage Account
     log_info "Creating Storage Account..."
     time_action "Create Storage Account" az storage account create \
         --name "$STORAGE_NAME" \
-        --resource-group "LAB460" \
+        --resource-group "$RESOURCE_GROUP" \
         --enable-hierarchical-namespace || {
         log_error "Failed to create storage account"
         return 1
     }
 }
+
+################################################################################
+# Summary and Configuration Functions
+################################################################################
 
 # Function to print summary
 print_summary() {
@@ -277,7 +393,7 @@ print_summary() {
     
     echo -e "\n${BLUE}=== Execution Summary ===${NC}"
     echo -e "\n${GREEN}Configuration:${NC}"
-    echo "Resource Group: LAB460"
+    echo "Resource Group: $RESOURCE_GROUP"
     echo "Location: $LOCATION"
     echo "Subscription ID: $SUBSCRIPTION_ID"
     echo "Cluster Name: $CLUSTER_NAME"
@@ -295,7 +411,7 @@ print_summary() {
     cat > azure_config.env << EOF
 export SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
 export LOCATION="$LOCATION"
-export RESOURCE_GROUP="LAB460"
+export RESOURCE_GROUP="$RESOURCE_GROUP"
 export CLUSTER_NAME="$CLUSTER_NAME"
 export STORAGE_NAME="$STORAGE_NAME"
 export AKV_NAME="$AKV_NAME"
@@ -305,7 +421,10 @@ EOF
     log_success "Configuration saved to azure_config.env"
 }
 
-# Main execution flow
+################################################################################
+# Main Execution
+################################################################################
+
 main() {
     log_info "Starting Azure setup script..."
     
@@ -319,7 +438,7 @@ main() {
     
     # Show configuration before proceeding
     echo -e "\n${BLUE}=== Configuration to be applied ===${NC}"
-    echo "Resource Group: LAB460"
+    echo "Resource Group: $RESOURCE_GROUP"
     echo "Location: $LOCATION"
     echo "Subscription ID: $SUBSCRIPTION_ID"
     echo "Cluster Name: $CLUSTER_NAME"
@@ -328,15 +447,64 @@ main() {
     
     read -p "Press Enter to continue or Ctrl+C to cancel..."
     
-    # Execute Azure operations
-    register_providers || exit 1
-    setup_connectedk8s || exit 1
-    configure_k3s || exit 1
-    create_azure_resources || exit 1
+    # Execute Azure operations with progress tracking and error handling
+    log_info "Starting Azure resource setup..."
     
-    # Print summary
+    # Register providers with progress indication
+    log_info "Step 1/4: Registering Azure providers"
+    if ! register_providers; then
+        log_error "Provider registration failed. Please check the errors above."
+        exit 1
+    fi
+    
+    # Setup connected kubernetes
+    log_info "Step 2/4: Setting up connected Kubernetes"
+    if ! setup_connectedk8s; then
+        log_error "Kubernetes setup failed. Please check the errors above."
+        exit 1
+    fi
+    
+    # Configure k3s
+    log_info "Step 3/4: Configuring k3s"
+    if ! configure_k3s; then
+        log_error "k3s configuration failed. Please check the errors above."
+        exit 1
+    fi
+    
+    # Create Azure resources
+    log_info "Step 4/4: Creating Azure resources"
+    if ! create_azure_resources; then
+        log_error "Resource creation failed. Please check the errors above."
+        exit 1
+    fi
+    
+    # Print summary of all operations
     print_summary
+    
+    log_success "Setup completed successfully!"
+    log_info "To load the configuration in a new session, run: source azure_config.env"
 }
+
+################################################################################
+# Script Execution
+################################################################################
+
+# Ensure script is run with bash
+if [ -z "$BASH_VERSION" ]; then
+    echo "This script must be run with bash"
+    exit 1
+fi
+
+# Ensure required commands are available
+for cmd in az jq kubectl; do
+    if ! command -v $cmd &>/dev/null; then
+        echo "Error: Required command '$cmd' not found"
+        exit 1
+    fi
+done
 
 # Execute main function
 main
+
+# Exit with success
+exit 0
