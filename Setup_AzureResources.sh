@@ -86,7 +86,6 @@ command_exists() {
 is_root() {
     [ "$(id -u)" -eq 0 ]
 }
-
 ################################################################################
 # Privilege Management Functions
 ################################################################################
@@ -100,7 +99,7 @@ check_sudo_privileges() {
         log_error "Please run this script as a normal user (not root)"
         log_info "The script will ask for sudo password when needed"
         exit 1
-    }
+    fi
     
     # Inform user about sudo requirements
     log_info "This script requires sudo privileges for:"
@@ -137,7 +136,7 @@ check_azure_login() {
     if ! command -v az >/dev/null 2>&1; then
         log_error "Azure CLI is not installed. Please install it first."
         exit 1
-    }
+    fi
     
     # Try to get current Azure login status
     if az account show &>/dev/null; then
@@ -163,10 +162,6 @@ check_azure_login() {
     az account show --query "{Subscription:name,UserName:user.name,TenantID:tenantId}" -o table
     return 0
 }
-
-################################################################################
-# Subscription Management Functions
-################################################################################
 
 # Function to get and validate subscription
 get_subscription() {
@@ -239,7 +234,6 @@ get_location() {
         fi
     done
 }
-
 ################################################################################
 # Kubernetes Setup Functions
 ################################################################################
@@ -272,7 +266,46 @@ install_kubectl() {
     fi
     
     log_success "kubectl installed successfully"
+    kubectl version --client
     return 0
+}
+
+# Function to get resource names
+get_resource_names() {
+    print_section "Getting Resource Names"
+    
+    # Get cluster name
+    while true; do
+        read -p "Enter cluster name (lowercase, no spaces): " CLUSTER_NAME
+        CLUSTER_NAME=$(format_text "$CLUSTER_NAME")
+        if [[ $CLUSTER_NAME =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; then
+            break
+        else
+            log_error "Invalid cluster name. Use lowercase letters, numbers, and hyphens."
+        fi
+    done
+    
+    # Get storage account name
+    while true; do
+        read -p "Enter storage account base name: " storage_base
+        STORAGE_NAME=$(format_text "${storage_base}st")
+        if [[ $STORAGE_NAME =~ ^[a-z0-9]{3,24}$ ]]; then
+            break
+        else
+            log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
+        fi
+    done
+    
+    # Get key vault name
+    while true; do
+        read -p "Enter key vault base name: " kv_base
+        AKV_NAME=$(format_text "${kv_base}akv")
+        if [[ $AKV_NAME =~ ^[a-z0-9-]{3,24}$ ]]; then
+            break
+        else
+            log_error "Invalid key vault name. Use 3-24 lowercase letters, numbers, and hyphens."
+        fi
+    done
 }
 
 # Function to verify kubeconfig
@@ -366,99 +399,6 @@ setup_connectedk8s() {
     return 0
 }
 
-################################################################################
-# Resource Name Management Functions
-################################################################################
-
-# Function to get resource names
-get_resource_names() {
-    print_section "Getting Resource Names"
-    
-    # Get cluster name
-    while true; do
-        read -p "Enter cluster name (lowercase, no spaces): " CLUSTER_NAME
-        CLUSTER_NAME=$(format_text "$CLUSTER_NAME")
-        if [[ $CLUSTER_NAME =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; then
-            break
-        else
-            log_error "Invalid cluster name. Use lowercase letters, numbers, and hyphens."
-        fi
-    done
-    
-    # Get storage account name
-    while true; do
-        read -p "Enter storage account base name: " storage_base
-        STORAGE_NAME=$(format_text "${storage_base}st")
-        if [[ $STORAGE_NAME =~ ^[a-z0-9]{3,24}$ ]]; then
-            break
-        else
-            log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
-        fi
-    done
-    
-    # Get key vault name
-    while true; do
-        read -p "Enter key vault base name: " kv_base
-        AKV_NAME=$(format_text "${kv_base}akv")
-        if [[ $AKV_NAME =~ ^[a-z0-9-]{3,24}$ ]]; then
-            break
-        else
-            log_error "Invalid key vault name. Use 3-24 lowercase letters, numbers, and hyphens."
-        fi
-    done
-}
-
-################################################################################
-# Azure Provider Registration Functions
-################################################################################
-
-# Function to register Azure providers
-register_providers() {
-    print_section "Registering Azure Providers"
-    
-    local providers=(
-        "Microsoft.ExtendedLocation"
-        "Microsoft.Kubernetes"
-        "Microsoft.KubernetesConfiguration"
-        "Microsoft.IoTOperations"
-        "Microsoft.DeviceRegistry"
-        "Microsoft.SecretSyncController"
-    )
-    
-    for provider in "${providers[@]}"; do
-        log_info "Checking provider: $provider"
-        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
-        
-        if [ "$status" != "Registered" ]; then
-            log_info "Registering provider: $provider"
-            if ! az provider register -n "$provider"; then
-                log_error "Failed to register $provider"
-                return 1
-            fi
-            
-            # Wait for registration
-            log_info "Waiting for $provider registration..."
-            while true; do
-                status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
-                if [ "$status" == "Registered" ]; then
-                    break
-                fi
-                log_info "Provider status: $status. Waiting..."
-                sleep 10
-            done
-        else
-            log_info "$provider already registered"
-        fi
-    done
-    
-    log_success "All providers successfully registered"
-    return 0
-}
-
-################################################################################
-# K3s Configuration Functions
-################################################################################
-
 # Function to configure k3s
 configure_k3s() {
     print_section "Configuring k3s"
@@ -507,6 +447,60 @@ configure_k3s() {
     fi
     
     log_success "k3s configuration completed"
+    return 0
+}
+################################################################################
+# Azure Provider Registration Functions
+################################################################################
+
+# Function to register Azure providers
+register_providers() {
+    print_section "Registering Azure Providers"
+    
+    local providers=(
+        "Microsoft.ExtendedLocation"
+        "Microsoft.Kubernetes"
+        "Microsoft.KubernetesConfiguration"
+        "Microsoft.IoTOperations"
+        "Microsoft.DeviceRegistry"
+        "Microsoft.SecretSyncController"
+    )
+    
+    for provider in "${providers[@]}"; do
+        log_info "Checking provider: $provider"
+        local status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null)
+        
+        if [ "$status" != "Registered" ]; then
+            log_info "Registering provider: $provider"
+            if ! az provider register -n "$provider"; then
+                log_error "Failed to register $provider"
+                return 1
+            fi
+            
+            # Wait for registration
+            log_info "Waiting for $provider registration..."
+            local max_attempts=30
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+                status=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+                if [ "$status" == "Registered" ]; then
+                    break
+                fi
+                log_info "Attempt $attempt/$max_attempts: Provider status: $status"
+                sleep 10
+                ((attempt++))
+            done
+            
+            if [ "$status" != "Registered" ]; then
+                log_error "Provider $provider failed to register in time"
+                return 1
+            fi
+        else
+            log_info "$provider already registered"
+        fi
+    done
+    
+    log_success "All providers successfully registered"
     return 0
 }
 
