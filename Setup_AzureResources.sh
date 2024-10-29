@@ -281,9 +281,54 @@ register_providers() {
 # Kubernetes Setup Functions
 ################################################################################
 
-# Function to setup connectedk8s
+# Function to verify kubeconfig
+verify_kubeconfig() {
+    print_section "Verifying Kubernetes Configuration"
+    
+    # Check if k3s is running
+    if ! systemctl is-active --quiet k3s; then
+        log_info "K3s service not running. Starting k3s..."
+        sudo systemctl start k3s
+        sleep 10  # Wait for k3s to start
+    fi
+    
+    # Ensure k3s.yaml exists
+    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+        log_error "k3s configuration file not found at /etc/rancher/k3s/k3s.yaml"
+        return 1
+    fi
+    
+    # Create .kube directory if it doesn't exist
+    mkdir -p ~/.kube
+    
+    # Copy and merge kubeconfig
+    log_info "Setting up kubeconfig..."
+    sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+    sudo chown $(id -u):$(id -g) ~/.kube/config
+    chmod 600 ~/.kube/config
+    
+    # Set KUBECONFIG environment variable
+    export KUBECONFIG=~/.kube/config
+    
+    # Verify kubectl can connect
+    if ! kubectl cluster-info &>/dev/null; then
+        log_error "Unable to connect to Kubernetes cluster"
+        return 1
+    fi
+    
+    log_success "Kubernetes configuration verified successfully"
+    return 0
+}
+
+# Updated setup_connectedk8s function
 setup_connectedk8s() {
     log_info "Setting up connected Kubernetes..."
+    
+    # Verify kubeconfig first
+    if ! verify_kubeconfig; then
+        log_error "Failed to verify Kubernetes configuration"
+        return 1
+    fi
     
     # Verify all required providers are registered first
     log_info "Verifying provider registration status..."
@@ -310,7 +355,12 @@ setup_connectedk8s() {
         }
     fi
     
-    # Connect cluster
+    # Verify kubectl context
+    log_info "Verifying kubectl context..."
+    kubectl config use-context default
+    
+    # Connect cluster with additional error handling
+    log_info "Connecting cluster to Azure Arc..."
     time_action "Connect Kubernetes cluster" az connectedk8s connect \
         --name "$CLUSTER_NAME" \
         -l "$LOCATION" \
@@ -319,6 +369,10 @@ setup_connectedk8s() {
         --enable-oidc-issuer \
         --enable-workload-identity || {
         log_error "Failed to connect Kubernetes cluster"
+        log_info "Checking cluster status..."
+        kubectl cluster-info
+        log_info "Checking kubeconfig..."
+        kubectl config view
         return 1
     }
     
@@ -330,18 +384,50 @@ setup_connectedk8s() {
         --output tsv)
 }
 
-# Function to configure k3s
+# Also update the configure_k3s function to ensure proper setup
 configure_k3s() {
     log_info "Configuring k3s..."
+    
+    # Backup existing config if it exists
+    if [ -f /etc/rancher/k3s/config.yaml ]; then
+        sudo cp /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.bak
+        log_info "Backed up existing k3s configuration"
+    fi
+    
+    # Create or update k3s config
     {
         echo "kube-apiserver-arg:"
         echo " - service-account-issuer=$ISSUER_URL_ID"
         echo " - service-account-max-token-expiration=24h"
-    } | sudo tee -a /etc/rancher/k3s/config.yaml > /dev/null
+    } | sudo tee /etc/rancher/k3s/config.yaml > /dev/null
     
     # Get Object ID and enable features
     OBJECT_ID=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)
     
+    # Restart k3s and wait for it to be ready
+    log_info "Restarting k3s..."
+    sudo systemctl restart k3s
+    
+    # Wait for k3s to be ready
+    log_info "Waiting for k3s to be ready..."
+    local max_attempts=30
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if kubectl cluster-info &>/dev/null; then
+            log_success "k3s is ready"
+            break
+        fi
+        log_info "Attempt $attempt/$max_attempts: Waiting for k3s to be ready..."
+        sleep 10
+        ((attempt++))
+    done
+    
+    if [ $attempt -gt $max_attempts ]; then
+        log_error "k3s did not become ready in time"
+        return 1
+    fi
+    
+    # Enable cluster features
     time_action "Enable cluster features" az connectedk8s enable-features \
         -n "$CLUSTER_NAME" \
         -g "$RESOURCE_GROUP" \
@@ -350,12 +436,8 @@ configure_k3s() {
         log_error "Failed to enable cluster features"
         return 1
     }
-    
-    time_action "Restart k3s" sudo systemctl restart k3s || {
-        log_error "Failed to restart k3s"
-        return 1
-    }
 }
+
 
 ################################################################################
 # Azure Resource Creation Functions
