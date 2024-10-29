@@ -76,55 +76,30 @@ handle_azure_auth() {
     
     print_info "Checking Azure login status..."
     
-    # Try to get current subscription info
-    if ! az account show > account_info.json 2>/dev/null; then
-        print_info "Not logged in. Starting Azure login..."
-        if ! az login > account_info.json; then
-            print_error "Azure login failed"
-            rm -f account_info.json
-            exit 1
-        fi
+    # Get current subscription info
+    local account_info
+    account_info=$(az account show 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        # Already logged in, extract info
+        SUBSCRIPTION_ID=$(echo "$account_info" | jq -r .id)
+        SUBSCRIPTION_NAME=$(echo "$account_info" | jq -r .name)
+        TENANT_ID=$(echo "$account_info" | jq -r .tenantId)
+        USER_NAME=$(echo "$account_info" | jq -r .user.name)
+
+        print_success "Already logged in to Azure"
+        print_info "Active Subscription Details:"
+        print_info "Subscription Name   : $SUBSCRIPTION_NAME"
+        print_info "Subscription ID     : $SUBSCRIPTION_ID"
+        print_info "Tenant ID          : $TENANT_ID"
+        print_info "User               : $USER_NAME"
+
+        export SUBSCRIPTION_ID
+        return 0
     fi
 
-    # Read and validate account info
-    if [ ! -s account_info.json ]; then
-        print_error "Failed to get account information"
-        rm -f account_info.json
-        exit 1
-    fi
-
-    # Extract subscription information
-    SUBSCRIPTION_ID=$(jq -r .id account_info.json)
-    SUBSCRIPTION_NAME=$(jq -r .name account_info.json)
-    TENANT_ID=$(jq -r .tenantId account_info.json)
-    USER_NAME=$(jq -r .user.name account_info.json)
-
-    # Clean up temp file
-    rm -f account_info.json
-
-    # Validate subscription info
-    if [[ -z "$SUBSCRIPTION_ID" || "$SUBSCRIPTION_ID" == "null" ]]; then
-        print_error "No subscription information found"
-        print_error "Please make sure you have an active subscription"
-        exit 1
-    fi
-
-    # Display current session information
-    print_success "Successfully authenticated with Azure"
-    print_info "Active Subscription Details:"
-    print_info "Subscription Name   : $SUBSCRIPTION_NAME"
-    print_info "Subscription ID     : $SUBSCRIPTION_ID"
-    print_info "Tenant ID          : $TENANT_ID"
-    print_info "User               : $USER_NAME"
-
-    # Set subscription as active
-    if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
-        print_error "Failed to set subscription as active"
-        exit 1
-    fi
-    print_success "Successfully set active subscription"
-    
-    export SUBSCRIPTION_ID
+    # If we get here, we're not logged in
+    print_error "Not logged in to Azure"
+    exit 1
 }
 
 # Main script starts here
