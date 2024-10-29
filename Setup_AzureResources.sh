@@ -7,15 +7,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Timing and tracking variables
-START_TIME=$(date +%s)
-declare -A OPERATION_TIMES=()
-declare -A OPERATION_STATUS=()
-
-# Fixed variables
-RG_NAME="LAB460"
-LOCATION="westus2"
-
 # Function to print section headers
 print_section() {
     echo -e "\n${BLUE}=== $1 ===${NC}"
@@ -36,127 +27,134 @@ print_info() {
     echo -e "${YELLOW}ℹ $1${NC}"
 }
 
-# Function to track operation timing
-track_operation() {
-    local operation=$1
-    local start_time=$(date +%s)
+# Function to validate and format resource names
+validate_name() {
+    local input=$1
+    local prefix=$2
+    local max_length=$3
     
-    # Execute the command and store its output and exit status
-    local output
-    output=$("${@:2}" 2>&1)
-    local status=$?
+    # Convert to lowercase and remove spaces
+    local formatted=$(echo "$input" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
     
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    OPERATION_TIMES[$operation]=$duration
-    if [ $status -eq 0 ]; then
-        OPERATION_STATUS[$operation]="SUCCESS"
-        print_success "$operation completed in $duration seconds"
-    else
-        OPERATION_STATUS[$operation]="FAILED"
-        print_error "$operation failed after $duration seconds"
-        echo "Error output: $output"
+    # Ensure it starts with letter and contains only letters and numbers
+    if [[ ! $formatted =~ ^[a-z][a-z0-9]*$ ]]; then
+        print_error "Name must start with a letter and contain only letters and numbers"
+        return 1
     fi
     
-    return $status
+    # Check length including prefix
+    if [ ${#formatted} -gt $max_length ]; then
+        print_error "Name too long (max $max_length characters including prefix)"
+        return 1
+    fi
+    
+    echo "$formatted"
+    return 0
 }
 
-# Function to handle Azure authentication and subscription
-handle_azure_auth() {
-    print_section "Azure Authentication"
-    
-    # Ensure DISPLAY is set for GUI applications
-    if [ -z "$DISPLAY" ]; then
-        export DISPLAY=:0
+# Function to check if Azure CLI is logged in
+check_azure_login() {
+    if ! az account show >/dev/null 2>&1; then
+        print_info "Please log in to Azure..."
+        az login
     fi
+}
 
-    # First check if already logged in
-    print_info "Checking current Azure login status..."
-    local account_info
-    account_info=$(az account show 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        print_info "Not logged in. Starting Azure login process..."
-        print_info "Opening browser for authentication... (If browser doesn't open, run 'az login' manually)"
-        
-        if ! az login; then
-            print_error "Azure login failed"
-            print_info "Please try running 'az login' manually"
-            exit 1
-        fi
-        
-        # Get updated account info after login
-        account_info=$(az account show)
+# Function to get available locations
+get_locations() {
+    az account list-locations --query "[].name" -o tsv
+}
+
+# Function to validate location
+validate_location() {
+    local location=$1
+    local locations=$(get_locations)
+    if [[ $locations == *"$location"* ]]; then
+        return 0
+    else
+        return 1
     fi
-
-    # Verify subscription info
-    SUBSCRIPTION_ID=$(echo "$account_info" | jq -r .id)
-    SUBSCRIPTION_NAME=$(echo "$account_info" | jq -r .name)
-    TENANT_ID=$(echo "$account_info" | jq -r .tenantId)
-    USER_NAME=$(echo "$account_info" | jq -r .user.name)
-
-    if [[ -z "$SUBSCRIPTION_ID" || "$SUBSCRIPTION_ID" == "null" ]]; then
-        print_error "No subscription information found"
-        print_error "Please make sure you have an active subscription"
-        exit 1
-    fi
-
-    print_success "Successfully authenticated with Azure"
-    print_info "Active Subscription Details:"
-    print_info "Subscription Name   : $SUBSCRIPTION_NAME"
-    print_info "Subscription ID     : $SUBSCRIPTION_ID"
-    print_info "Tenant ID          : $TENANT_ID"
-    print_info "User               : $USER_NAME"
-
-    # Ensure subscription is set as active
-    if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
-        print_error "Failed to set subscription as active"
-        exit 1
-    fi
-    print_success "Successfully set active subscription"
-    
-    export SUBSCRIPTION_ID
 }
 
 # Main script starts here
-print_section "Azure Arc Cluster Setup"
-print_info "Setting up Azure Arc environment in $LOCATION"
+print_section "Azure Resource Setup for LAB460"
+print_info "This script will help you set up Azure resources for Arc-enabled Kubernetes"
 
-# Check Azure CLI installation
-if ! command -v az >/dev/null 2>&1; then
-    print_error "Azure CLI is not installed. Please install it first."
-    exit 1
-fi
+# Check Azure CLI login
+check_azure_login
 
-# Check jq installation
-if ! command -v jq >/dev/null 2>&1; then
-    print_error "jq is not installed. Installing..."
-    sudo apt-get update && sudo apt-get install -y jq
-    if [ $? -ne 0 ]; then
-        print_error "Failed to install jq. Please install it manually."
-        exit 1
+# Get subscription ID
+print_section "Subscription Selection"
+az account list --query "[].{name:name, id:id}" -o table
+echo
+read -p "Enter your subscription ID: " SUBSCRIPTION_ID
+az account set --subscription $SUBSCRIPTION_ID
+
+# Get location
+print_section "Location Selection"
+print_info "Available locations:"
+az account list-locations --query "[].name" -o table
+echo
+while true; do
+    read -p "Enter the Azure location: " LOCATION
+    LOCATION=$(echo "$LOCATION" | tr '[:upper:]' '[:lower:]')
+    if validate_location "$LOCATION"; then
+        break
+    else
+        print_error "Invalid location. Please choose from the list above."
     fi
-fi
+done
 
-# Handle Azure authentication
-handle_azure_auth
+# Set resource group
+RESOURCE_GROUP="lab460"
+print_success "Using resource group: $RESOURCE_GROUP"
 
-# Generate resource names (lowercase)
-CLUSTER_NAME="${RG_NAME,,}-cluster"
-STORAGE_NAME="${RG_NAME,,}st"
-AKV_NAME="${RG_NAME,,}akv"
+# Get cluster name
+print_section "Cluster Configuration"
+while true; do
+    read -p "Enter the Arc-enabled cluster name: " CLUSTER_NAME
+    CLUSTER_NAME=$(validate_name "$CLUSTER_NAME" "" 63)
+    if [ $? -eq 0 ]; then
+        break
+    fi
+done
 
-# Show configuration
-print_section "Configuration"
-print_info "Resource Group: $RG_NAME"
-print_info "Location: $LOCATION"
-print_info "Cluster Name: $CLUSTER_NAME"
-print_info "Storage Account: $STORAGE_NAME"
-print_info "Key Vault: $AKV_NAME"
+# Get storage account name
+print_section "Storage Account Configuration"
+while true; do
+    read -p "Enter the storage account name (without 'st' suffix): " STORAGE_BASE
+    STORAGE_NAME="${STORAGE_BASE}st"
+    STORAGE_NAME=$(validate_name "$STORAGE_NAME" "" 24)
+    if [ $? -eq 0 ]; then
+        break
+    fi
+done
 
-# Register providers
+# Get Key Vault name
+print_section "Key Vault Configuration"
+while true; do
+    read -p "Enter the Key Vault name (without 'akv' suffix): " KV_BASE
+    AKV_NAME="${KV_BASE}akv"
+    AKV_NAME=$(validate_name "$AKV_NAME" "" 24)
+    if [ $? -eq 0 ]; then
+        break
+    fi
+done
+
+# Summary before execution
+print_section "Configuration Summary"
+echo "Subscription ID: $SUBSCRIPTION_ID"
+echo "Location: $LOCATION"
+echo "Resource Group: $RESOURCE_GROUP"
+echo "Cluster Name: $CLUSTER_NAME"
+echo "Storage Account: $STORAGE_NAME"
+echo "Key Vault: $AKV_NAME"
+
+read -p "Press Enter to continue or Ctrl+C to cancel..."
+
+# Execute Azure commands
 print_section "Registering Azure Providers"
-providers=(
+PROVIDERS=(
     "Microsoft.ExtendedLocation"
     "Microsoft.Kubernetes"
     "Microsoft.KubernetesConfiguration"
@@ -165,40 +163,40 @@ providers=(
     "Microsoft.SecretSyncController"
 )
 
-for provider in "${providers[@]}"; do
-    print_info "Registering provider: $provider"
-    track_operation "Register $provider" az provider register -n "$provider" --wait
+for provider in "${PROVIDERS[@]}"; do
+    print_info "Registering $provider..."
+    az provider register -n "$provider"
 done
 
-# Add/upgrade extensions
-print_section "Installing Azure CLI Extensions"
-track_operation "Install connectedk8s extension" az extension add --upgrade --name connectedk8s
+print_section "Installing Azure Extensions"
+print_info "Adding connectedk8s extension..."
+az extension add --upgrade --name connectedk8s
 
-# Create resource group
+# Create resource group if it doesn't exist
 print_section "Creating Resource Group"
-track_operation "Create Resource Group" az group create --name $RG_NAME --location $LOCATION
+az group create --name $RESOURCE_GROUP --location $LOCATION
 
-# Connect cluster to Arc
-print_section "Connecting Cluster to Arc"
-track_operation "Connect to Arc" az connectedk8s connect \
+# Connect the cluster
+print_section "Connecting Kubernetes Cluster"
+print_info "Connecting cluster to Azure Arc..."
+az connectedk8s connect \
     --name $CLUSTER_NAME \
     -l $LOCATION \
-    --resource-group $RG_NAME \
+    --resource-group $RESOURCE_GROUP \
     --subscription $SUBSCRIPTION_ID \
     --enable-oidc-issuer \
     --enable-workload-identity
 
-# Get OIDC issuer URL
-print_section "Configuring OIDC"
-ISSUER_URL_ID=$(az connectedk8s show \
-    --resource-group $RG_NAME \
+# Get OIDC Issuer URL
+print_info "Getting OIDC Issuer URL..."
+export ISSUER_URL_ID=$(az connectedk8s show \
+    --resource-group $RESOURCE_GROUP \
     --name $CLUSTER_NAME \
-    --subscription $SUBSCRIPTION_ID \
     --query oidcIssuerProfile.issuerUrl \
     --output tsv)
 
-# Configure k3s service account
 print_section "Configuring K3s Service Account"
+# Update K3s configuration
 {
     echo "kube-apiserver-arg:"
     echo " - service-account-issuer=$ISSUER_URL_ID"
@@ -207,67 +205,54 @@ print_section "Configuring K3s Service Account"
 
 # Enable features
 print_section "Enabling Arc Features"
-OBJECT_ID=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)
-track_operation "Enable Arc Features" az connectedk8s enable-features \
+print_info "Getting Object ID..."
+export OBJECT_ID=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)
+
+print_info "Enabling cluster features..."
+az connectedk8s enable-features \
     -n $CLUSTER_NAME \
-    -g $RG_NAME \
-    --subscription $SUBSCRIPTION_ID \
+    -g $RESOURCE_GROUP \
     --custom-locations-oid $OBJECT_ID \
     --features cluster-connect custom-locations
 
-# Restart k3s
-print_section "Restarting K3s"
-track_operation "Restart k3s" systemctl restart k3s
+print_info "Restarting K3s..."
+sudo systemctl restart k3s
 
 # Create Key Vault
 print_section "Creating Key Vault"
-track_operation "Create Key Vault" az keyvault create \
+print_info "Creating Key Vault $AKV_NAME..."
+AKV_RESULT=$(az keyvault create \
     --enable-rbac-authorization \
     --name $AKV_NAME \
-    --resource-group $RG_NAME \
-    --subscription $SUBSCRIPTION_ID \
-    --location $LOCATION
+    --resource-group $RESOURCE_GROUP)
+export AKV_ID=$(echo $AKV_RESULT | jq -r '.id')
 
 # Create Storage Account
 print_section "Creating Storage Account"
-track_operation "Create Storage Account" az storage account create \
+print_info "Creating Storage Account $STORAGE_NAME..."
+az storage account create \
     --name $STORAGE_NAME \
-    --resource-group $RG_NAME \
-    --subscription $SUBSCRIPTION_ID \
-    --location $LOCATION \
+    --resource-group $RESOURCE_GROUP \
     --enable-hierarchical-namespace
 
-# Save environment variables
-print_section "Saving Environment Variables"
-cat << EOF > ./azure-resources.env
-export SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
-export RESOURCE_GROUP="$RG_NAME"
-export LOCATION="$LOCATION"
-export CLUSTER_NAME="$CLUSTER_NAME"
-export STORAGE_NAME="$STORAGE_NAME"
-export AKV_NAME="$AKV_NAME"
-export ISSUER_URL_ID="$ISSUER_URL_ID"
-EOF
-
-# Print completion time
-END_TIME=$(date +%s)
-DURATION=$((END_TIME - START_TIME))
-
 print_section "Setup Complete"
-print_success "Azure Arc cluster setup completed"
-print_info "Environment variables saved to ./azure-resources.env"
-print_info "To load variables, run: source ./azure-resources.env"
-print_info "Total setup time: $(($DURATION / 60)) minutes and $(($DURATION % 60)) seconds"
+print_success "Azure resources have been created successfully"
+print_info "Key Vault ID: $AKV_ID"
+print_info "Please save these values for future use"
 
-# Print operation summary
-print_section "Operation Summary"
-for operation in "${!OPERATION_TIMES[@]}"; do
-    status_color=$RED
-    if [ "${OPERATION_STATUS[$operation]}" == "SUCCESS" ]; then
-        status_color=$GREEN
-    fi
-    echo -e "Operation: $operation"
-    echo -e "Status: ${status_color}${OPERATION_STATUS[$operation]}${NC}"
-    echo -e "Time: ${OPERATION_TIMES[$operation]} seconds"
-    echo "---"
-done
+# Save variables to a file
+print_section "Saving Configuration"
+CONFIG_FILE="azure_config.env"
+{
+    echo "export SUBSCRIPTION_ID=\"$SUBSCRIPTION_ID\""
+    echo "export LOCATION=\"$LOCATION\""
+    echo "export RESOURCE_GROUP=\"$RESOURCE_GROUP\""
+    echo "export CLUSTER_NAME=\"$CLUSTER_NAME\""
+    echo "export STORAGE_NAME=\"$STORAGE_NAME\""
+    echo "export AKV_NAME=\"$AKV_NAME\""
+    echo "export AKV_ID=\"$AKV_ID\""
+    echo "export ISSUER_URL_ID=\"$ISSUER_URL_ID\""
+} > $CONFIG_FILE
+
+print_success "Configuration saved to $CONFIG_FILE"
+print_info "To load these variables in a new session, run: source $CONFIG_FILE"
