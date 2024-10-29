@@ -74,79 +74,57 @@ check_azure_cli() {
 handle_azure_auth() {
     print_section "Azure Authentication"
     
-    # Check if Azure CLI is installed
-    if ! command -v az >/dev/null 2>&1; then
-        print_error "Azure CLI is not installed. Please install it first."
-        exit 1
-    fi
-
-    # Check if jq is installed
-    if ! command -v jq >/dev/null 2>&1; then
-        print_error "jq is not installed. Installing..."
-        sudo apt-get update && sudo apt-get install -y jq
-        if [ $? -ne 0 ]; then
-            print_error "Failed to install jq. Please install it manually."
-            exit 1
-        fi
-    fi
-
-    # Try to get subscription info first
     print_info "Checking Azure login status..."
-    local login_check=$(az account show 2>/dev/null)
     
-    # If not logged in, trigger login
-    if [ $? -ne 0 ]; then
+    # Try to get current subscription info
+    if ! az account show > account_info.json 2>/dev/null; then
         print_info "Not logged in. Starting Azure login..."
-        login_check=$(az login 2>/dev/null)
-        if [ $? -ne 0 ]; then
+        if ! az login > account_info.json; then
             print_error "Azure login failed"
+            rm -f account_info.json
             exit 1
         fi
     fi
 
-    # Parse subscription info from the JSON output
-    # Using printf to ensure newlines in JSON don't affect parsing
-    printf "%s" "$login_check" | jq -e . >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        print_error "Failed to parse Azure account information"
+    # Read and validate account info
+    if [ ! -s account_info.json ]; then
+        print_error "Failed to get account information"
+        rm -f account_info.json
         exit 1
     fi
 
-    # Get subscription details
-    local sub_info=$(printf "%s" "$login_check" | jq -r '. | select(.id != null)')
-    if [ -z "$sub_info" ]; then
+    # Extract subscription information
+    SUBSCRIPTION_ID=$(jq -r .id account_info.json)
+    SUBSCRIPTION_NAME=$(jq -r .name account_info.json)
+    TENANT_ID=$(jq -r .tenantId account_info.json)
+    USER_NAME=$(jq -r .user.name account_info.json)
+
+    # Clean up temp file
+    rm -f account_info.json
+
+    # Validate subscription info
+    if [[ -z "$SUBSCRIPTION_ID" || "$SUBSCRIPTION_ID" == "null" ]]; then
         print_error "No subscription information found"
-        exit 1
-    fi
-
-    local sub_id=$(printf "%s" "$sub_info" | jq -r .id)
-    local sub_name=$(printf "%s" "$sub_info" | jq -r .name)
-    local tenant_name=$(printf "%s" "$sub_info" | jq -r .tenantId)
-    local user_name=$(printf "%s" "$sub_info" | jq -r .user.name)
-
-    # Verify subscription ID
-    if [[ -z "$sub_id" || "$sub_id" == "null" ]]; then
-        print_error "No valid subscription ID found"
+        print_error "Please make sure you have an active subscription"
         exit 1
     fi
 
     # Display current session information
     print_success "Successfully authenticated with Azure"
     print_info "Active Subscription Details:"
-    print_info "Subscription Name   : $sub_name"
-    print_info "Subscription ID     : $sub_id"
-    print_info "Tenant ID          : $tenant_name"
-    print_info "User               : $user_name"
+    print_info "Subscription Name   : $SUBSCRIPTION_NAME"
+    print_info "Subscription ID     : $SUBSCRIPTION_ID"
+    print_info "Tenant ID          : $TENANT_ID"
+    print_info "User               : $USER_NAME"
 
-    # Export subscription ID for use in script
-    export SUBSCRIPTION_ID="$sub_id"
-    
-    # Verify subscription is active
+    # Set subscription as active
     if ! az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
         print_error "Failed to set subscription as active"
         exit 1
     fi
     print_success "Successfully set active subscription"
+    
+    export SUBSCRIPTION_ID
 }
 
 # Main script starts here
