@@ -123,13 +123,6 @@ validate_input() {
     local type=$2
 
     case $type in
-        "subscription")
-            # Validate GUID format
-            if [[ ! $input =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-                print_error "Invalid subscription ID format"
-                return 1
-            fi
-            ;;
         "location")
             # Convert to lowercase
             input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
@@ -153,32 +146,66 @@ validate_input() {
     return 0
 }
 
+# Function to get and validate subscription
+get_subscription_info() {
+    local sub_info=$(az account show 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        local sub_id=$(echo $sub_info | jq -r .id)
+        local sub_name=$(echo $sub_info | jq -r .name)
+        local sub_state=$(echo $sub_info | jq -r .state)
+        print_success "Using current subscription:"
+        print_info "Name    : $sub_name"
+        print_info "ID      : $sub_id"
+        print_info "State   : $sub_state"
+        echo "$sub_id"
+        return 0
+    else
+        print_error "No active subscription found"
+        exit 1
+    fi
+}
+
 # Main script
 print_section "Azure Arc Cluster Setup"
 print_info "This script will help you set up an Arc-enabled Kubernetes cluster in Azure"
+
+# Check Azure CLI installation
+if ! command -v az >/dev/null 2>&1; then
+    print_error "Azure CLI is not installed. Please install it first."
+    exit 1
+fi
 
 # Set resource group name (uppercase)
 RG_NAME="LAB460"
 print_success "Using resource group: $RG_NAME"
 
+# Handle Azure login and subscription
+print_section "Azure Authentication"
+if ! az account show >/dev/null 2>&1; then
+    print_info "Not logged in to Azure. Initiating login..."
+    track_operation "Azure Login" az login
+else
+    print_success "Already logged in to Azure"
+    OPERATION_STATUS["Azure Login"]="SKIPPED"
+fi
+
 # Get subscription ID
-print_info "Your Azure Subscription ID can be found in the Azure Portal under Subscriptions"
-SUBSCRIPTION_ID=$(validate_input "$(read -p 'Enter your Azure Subscription ID: ' sid && echo $sid)" "subscription")
+SUBSCRIPTION_ID=$(get_subscription_info)
+track_operation "Set Subscription" az account set --subscription "$SUBSCRIPTION_ID"
 
 # Get location
 print_info "Available locations can be found using 'az account list-locations --query \"[].name\" -o tsv'"
 LOCATION=$(validate_input "$(read -p 'Enter Azure region (e.g., eastus): ' loc && echo $loc)" "location")
 
 # Generate lowercase resource names
-CLUSTER_NAME="${rg_name,,}-cluster"  # Convert to lowercase
-STORAGE_NAME="${rg_name,,}st"        # Convert to lowercase and add suffix
-AKV_NAME="${rg_name,,}akv"          # Convert to lowercase and add suffix
+CLUSTER_NAME="${RG_NAME,,}-cluster"  # Convert to lowercase
+STORAGE_NAME="${RG_NAME,,}st"        # Convert to lowercase and add suffix
+AKV_NAME="${RG_NAME,,}akv"          # Convert to lowercase and add suffix
 
 # Confirm settings
 print_section "Configuration Summary"
-echo "Subscription ID: $SUBSCRIPTION_ID"
-echo "Location: $LOCATION"
 echo "Resource Group: $RG_NAME"
+echo "Location: $LOCATION"
 echo "Cluster Name: $CLUSTER_NAME"
 echo "Storage Account Name: $STORAGE_NAME"
 echo "Key Vault Name: $AKV_NAME"
@@ -188,10 +215,6 @@ if [[ $confirm != [yY] ]]; then
     print_info "Setup cancelled"
     exit 0
 fi
-
-# Login to Azure
-print_section "Azure Login"
-track_operation "Azure Login" az login
 
 # Register providers
 print_section "Provider Registration"
