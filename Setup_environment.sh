@@ -1,39 +1,42 @@
 #!/bin/bash
 
-# Color codes for pretty output
+# Color codes for pretty output - makes the script output more readable
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Arrays to track installation status
-declare -A INSTALLED_PACKAGES=()
-declare -A SKIPPED_PACKAGES=()
-declare -A FAILED_PACKAGES=()
-declare -A SYSTEM_CHANGES=()
+# Arrays to track installation status throughout the script execution
+declare -A INSTALLED_PACKAGES=()     # Tracks newly installed packages
+declare -A SKIPPED_PACKAGES=()       # Tracks already installed packages
+declare -A FAILED_PACKAGES=()        # Tracks failed installations
+declare -A SYSTEM_CHANGES=()         # Tracks system configuration changes
 
-# Function to print section headers
+# Function to print section headers with consistent formatting
 print_section() {
     echo -e "\n${BLUE}=== $1 ===${NC}"
 }
 
-# Function to print success messages
+# Function to print success messages with green checkmark
 print_success() {
     echo -e "${GREEN}✔ $1${NC}"
 }
 
-# Function to print error messages
+# Function to print error messages with red X
 print_error() {
     echo -e "${RED}✖ $1${NC}"
 }
 
-# Function to print info messages
+# Function to print information messages with yellow info symbol
 print_info() {
     echo -e "${YELLOW}ℹ $1${NC}"
 }
 
 # Function to check command status and track results
+# Parameters:
+#   $1: command name
+#   $2: exit status of the command
 check_status() {
     local command_name=$1
     local status=$2
@@ -48,25 +51,32 @@ check_status() {
     fi
 }
 
-# Function to check if a command exists
+# Function to check if a command exists in the system PATH
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
 # Function to check if a file contains a specific line
+# Parameters:
+#   $1: line to search for
+#   $2: file to search in
 file_contains() {
     grep -Fxq "$1" "$2" 2>/dev/null
 }
 
 # Function to add a system change to tracking
+# Parameters:
+#   $1: change description
+#   $2: change details
 track_change() {
     SYSTEM_CHANGES[$1]="$2"
 }
 
-# Function to check system requirements
+# Function to check system requirements before installation
 check_system_requirements() {
     print_section "Checking System Requirements"
     
+    # Check for minimum required disk space (5GB)
     local required_space=5120  # 5GB in MB
     local available_space=$(df -m / | awk 'NR==2 {print $4}')
     
@@ -76,6 +86,7 @@ check_system_requirements() {
     fi
     print_success "Disk space check passed"
     
+    # Check for sudo privileges
     if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
         print_error "Script requires sudo privileges"
         exit 1
@@ -83,10 +94,11 @@ check_system_requirements() {
     print_success "Privilege check passed"
 }
 
-# Function to print installation summary
+# Function to print installation summary at the end of script execution
 print_summary() {
     print_section "Installation Summary"
     
+    # Print successfully installed packages
     if [ ${#INSTALLED_PACKAGES[@]} -gt 0 ]; then
         echo -e "${GREEN}Successfully Installed:${NC}"
         for pkg in "${!INSTALLED_PACKAGES[@]}"; do
@@ -94,6 +106,7 @@ print_summary() {
         done
     fi
     
+    # Print skipped packages (already installed)
     if [ ${#SKIPPED_PACKAGES[@]} -gt 0 ]; then
         echo -e "\n${YELLOW}Skipped (Already Installed):${NC}"
         for pkg in "${!SKIPPED_PACKAGES[@]}"; do
@@ -101,6 +114,7 @@ print_summary() {
         done
     fi
     
+    # Print failed installations
     if [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
         echo -e "\n${RED}Failed Installations:${NC}"
         for pkg in "${!FAILED_PACKAGES[@]}"; do
@@ -108,6 +122,7 @@ print_summary() {
         done
     fi
     
+    # Print system changes made
     if [ ${#SYSTEM_CHANGES[@]} -gt 0 ]; then
         echo -e "\n${BLUE}System Changes:${NC}"
         for change in "${!SYSTEM_CHANGES[@]}"; do
@@ -116,7 +131,7 @@ print_summary() {
     fi
 }
 
-# Function to verify and load environment
+# Function to verify and load environment configurations
 verify_and_load_environment() {
     print_section "Verifying and Loading Environment"
     
@@ -129,9 +144,9 @@ verify_and_load_environment() {
         fi
     done
     
-    # Load kubectl completion if available
+    # Configure kubectl bash completion if kubectl is available
     if command_exists kubectl; then
-        # First ensure bash-completion is installed
+        # Ensure bash-completion is installed
         if ! dpkg -l | grep -q bash-completion; then
             sudo apt-get install -y bash-completion
         fi
@@ -146,9 +161,8 @@ verify_and_load_environment() {
         fi
     fi
     
-    # Load Azure CLI completion if available
+    # Configure Azure CLI completion if available
     if command_exists az; then
-        # Add az completion to bashrc if not already present
         if ! grep -q "az completion bash" ~/.bashrc; then
             az completion bash | sudo tee /etc/bash_completion.d/azure-cli > /dev/null
             echo 'source <(az completion bash)' >>~/.bashrc
@@ -158,24 +172,24 @@ verify_and_load_environment() {
         fi
     fi
     
-    # Verify KUBECONFIG
+    # Verify KUBECONFIG environment variable
     if [ -f ~/.kube/config ]; then
         export KUBECONFIG=~/.kube/config
         print_success "KUBECONFIG set to ~/.kube/config"
     fi
 }
 
-# Main script starts here
+# Main script execution starts here
 print_section "Starting Non-Interactive Environment Setup"
 print_info "Running in non-interactive mode with automatic yes to prompts"
 
-# Set non-interactive frontend for apt
+# Set non-interactive frontend for apt to prevent prompts
 export DEBIAN_FRONTEND=noninteractive
 
-# Check system requirements
+# Perform system requirement checks
 check_system_requirements
 
-# System update
+# Update system packages
 print_section "Updating System Packages"
 if sudo apt-get update && sudo apt-get dist-upgrade -y; then
     track_change "System Update" "Completed successfully"
@@ -184,7 +198,7 @@ else
     exit 1
 fi
 
-# Install basic dependencies
+# Install basic system dependencies
 print_section "Installing Basic Dependencies"
 DEPS="wget gpg apt-transport-https ca-certificates curl gnupg lsb-release"
 for dep in $DEPS; do
@@ -197,7 +211,7 @@ for dep in $DEPS; do
     fi
 done
 
-# VS Code setup
+# Configure VS Code repository
 print_section "Setting up VS Code Repository"
 if ! command_exists code; then
     wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
@@ -211,9 +225,10 @@ else
     print_info "VS Code repository already configured"
 fi
 
-# Azure CLI setup
+# Configure Azure CLI repository and install Azure CLI with Arc extension
 print_section "Setting up Azure CLI Repository"
 if ! command_exists az; then
+    # Add Azure CLI repository
     sudo mkdir -p /etc/apt/keyrings
     curl -sLS https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/microsoft.gpg > /dev/null
     sudo chmod go+r /etc/apt/keyrings/microsoft.gpg
@@ -223,25 +238,71 @@ URIs: https://packages.microsoft.com/repos/azure-cli/
 Suites: ${AZ_DIST}
 Components: main
 Architectures: $(dpkg --print-architecture)
-Signed-by: /etc/apt/keyrings/microsoft.gpg" | sudo tee /etc/apt/sources.list.d/azure-cli.sources
+Signed-By: /etc/apt/keyrings/microsoft.gpg" | sudo tee /etc/apt/sources.list.d/azure-cli.sources
     track_change "Azure CLI Repository" "Added"
+    
+    # Install Azure CLI
+    sudo apt-get update
+    sudo apt-get install -y azure-cli
+    check_status "Azure CLI" $?
+    
+    # Install Azure Arc extension
+    az extension add --name connectedk8s --version 1.9.3
+    check_status "Azure Arc Extension" $?
+    track_change "Azure Arc Extension" "Installed version 1.9.3"
 else
     SKIPPED_PACKAGES["Azure CLI"]="Already installed"
     print_info "Azure CLI repository already configured"
+    
+    # Check and install Arc extension even if Azure CLI exists
+    if ! az extension show --name connectedk8s &>/dev/null; then
+        az extension add --name connectedk8s --version 1.9.3
+        check_status "Azure Arc Extension" $?
+        track_change "Azure Arc Extension" "Installed version 1.9.3"
+    else
+        SKIPPED_PACKAGES["Azure Arc Extension"]="Already installed"
+        print_info "Azure Arc extension already installed"
+    fi
 fi
 
-# K3s setup
+# Install and configure K3s
 print_section "Installing K3s"
 if ! command_exists k3s; then
     curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
     check_status "K3s" $?
     track_change "K3s Installation" "Completed"
+    
+    # Configure kubectl access
+    mkdir -p $HOME/.kube
+    sudo cp /etc/rancher/k3s/k3s.yaml $HOME/.kube/config
+    sudo chown $(id -u):$(id -g) $HOME/.kube/config
+    chmod 600 $HOME/.kube/config
+    export KUBECONFIG=$HOME/.kube/config
+    
+    # Verify kubectl access
+    if kubectl get nodes &>/dev/null; then
+        print_success "kubectl configured successfully"
+        track_change "kubectl Configuration" "Completed"
+    else
+        print_error "kubectl configuration failed"
+        FAILED_PACKAGES["kubectl configuration"]="Failed to configure access"
+    fi
 else
     SKIPPED_PACKAGES["K3s"]="Already installed"
     print_info "K3s already installed"
+    
+    # Ensure kubectl is properly configured even if K3s exists
+    if [ ! -f $HOME/.kube/config ]; then
+        mkdir -p $HOME/.kube
+        sudo cp /etc/rancher/k3s/k3s.yaml $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+        export KUBECONFIG=$HOME/.kube/config
+        track_change "kubectl Configuration" "Updated"
+    fi
 fi
 
-# Kubernetes tools setup
+# Configure Kubernetes tools repository
 print_section "Setting up Kubernetes Tools"
 if ! command_exists kubectl; then
     sudo mkdir -p -m 755 /etc/apt/keyrings
@@ -256,7 +317,7 @@ else
     print_info "Kubernetes tools already configured"
 fi
 
-# Helm setup
+# Configure Helm repository
 print_section "Setting up Helm Repository"
 if ! command_exists helm; then
     curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
@@ -268,7 +329,7 @@ else
     print_info "Helm repository already configured"
 fi
 
-# Install all tools
+# Install all required tools
 print_section "Installing Tools"
 sudo apt-get update
 TOOLS="code azure-cli git kubectl helm jq"
@@ -281,21 +342,6 @@ for tool in $TOOLS; do
         print_info "$tool already installed"
     fi
 done
-
-# Configure K3s
-print_section "Configuring K3s"
-if [ ! -f ~/.kube/config ]; then
-    mkdir -p ~/.kube
-    sudo KUBECONFIG=~/.kube/config:/etc/rancher/k3s/k3s.yaml kubectl config view --flatten > ~/.kube/merged
-    mv ~/.kube/merged ~/.kube/config
-    chmod 0600 ~/.kube/config
-    export KUBECONFIG=~/.kube/config
-    kubectl config use-context default
-    track_change "K3s Configuration" "Created new config"
-else
-    print_info "K3s configuration already exists"
-    SKIPPED_PACKAGES["K3s config"]="Already configured"
-fi
 
 # Configure system settings
 print_section "Configuring System Settings"
@@ -315,12 +361,13 @@ for setting in "${SYSCTL_SETTINGS[@]}"; do
 done
 sudo sysctl -p
 
-# Verify and load environment
+# Verify and load environment configurations
 verify_and_load_environment
 
 # Print installation summary
 print_summary
 
+# Print final instructions
 print_section "Final Steps"
 print_info "To complete the setup, please run:"
 echo "source ~/.bashrc"
