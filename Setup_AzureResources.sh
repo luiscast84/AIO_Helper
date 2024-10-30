@@ -598,16 +598,22 @@ create_azure_resources() {
         kvResult=$(az keyvault create \
             --enable-rbac-authorization \
             --name "$AKV_NAME" \
-            --resource-group "$RESOURCE_GROUP" 2>&1)
+            --resource-group "$RESOURCE_GROUP" \
+            --output json 2>&1)
         
         if [ $? -eq 0 ]; then
             success=true
-            AKV_ID=$(echo "$kvResult" | jq -r '.id')
-            if [ -z "$AKV_ID" ] || [ "$AKV_ID" = "null" ]; then
-                log_error "Failed to get Key Vault ID"
-                return 1
+            # Extract ID from the correct JSON path
+            AKV_ID=$(echo "$kvResult" | jq -r '.id // empty')
+            if [ -z "$AKV_ID" ]; then
+                # If .id is empty, try the full resource ID path
+                AKV_ID="/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.KeyVault/vaults/$AKV_NAME"
+                if ! az keyvault show --name "$AKV_NAME" --query id -o tsv &>/dev/null; then
+                    log_error "Failed to get Key Vault ID and couldn't verify vault existence"
+                    return 1
+                fi
             fi
-            log_success "Key Vault $AKV_NAME created successfully"
+            log_success "Key Vault $AKV_NAME created successfully with ID: $AKV_ID"
         else
             if echo "$kvResult" | grep -q "already exists"; then
                 local action=$(handle_resource_conflict "akv" "$AKV_NAME" "$RESOURCE_GROUP")
