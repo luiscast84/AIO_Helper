@@ -5,10 +5,12 @@
 #
 # This script automates the setup of Azure Arc-enabled Kubernetes cluster and
 # associated resources, handling proper privilege management for each operation.
+# Assumes K3s is already installed and configured.
 #
 # Requirements:
 # - Run as a normal user (not root)
 # - Sudo privileges available for system operations
+# - K3s already installed and running
 # - Azure CLI installed
 # - kubectl and jq commands available
 ################################################################################
@@ -103,7 +105,6 @@ check_sudo_privileges() {
     
     # Inform user about sudo requirements
     log_info "This script requires sudo privileges for:"
-    echo "  - Installing system packages"
     echo "  - Configuring k3s"
     echo "  - Modifying system settings"
     echo -e "\nOther operations like Azure login will run as current user"
@@ -124,6 +125,52 @@ check_sudo_privileges() {
     log_success "Sudo privileges confirmed"
 }
 
+################################################################################
+# Kubernetes Verification Functions
+################################################################################
+
+# Function to verify kubernetes prerequisites
+verify_kubernetes_prereqs() {
+    print_section "Verifying Kubernetes Prerequisites"
+    
+    # Check if k3s is installed and running
+    if ! systemctl is-active --quiet k3s; then
+        log_error "K3s is not running. Please ensure K3s is installed and running"
+        return 1
+    fi
+    log_success "K3s service is running"
+    
+    # Verify kubectl is installed
+    if ! command -v kubectl &>/dev/null; then
+        log_error "kubectl is not installed. Please install kubectl first"
+        return 1
+    fi
+    log_success "kubectl is installed"
+    
+    # Verify kubeconfig
+    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+        log_error "K3s configuration file not found at /etc/rancher/k3s/k3s.yaml"
+        return 1
+    fi
+    
+    # Set up kubeconfig if not already done
+    if [ ! -f "$HOME/.kube/config" ]; then
+        mkdir -p "$HOME/.kube"
+        sudo cp /etc/rancher/k3s/k3s.yaml "$HOME/.kube/config"
+        sudo chown $(id -u):$(id -g) "$HOME/.kube/config"
+        chmod 600 "$HOME/.kube/config"
+    fi
+    export KUBECONFIG="$HOME/.kube/config"
+    
+    # Verify cluster access
+    if ! kubectl cluster-info &>/dev/null; then
+        log_error "Unable to connect to Kubernetes cluster"
+        return 1
+    fi
+    log_success "Successfully connected to Kubernetes cluster"
+    
+    return 0
+}
 ################################################################################
 # Azure Authentication Functions
 ################################################################################
@@ -235,40 +282,8 @@ get_location() {
     done
 }
 ################################################################################
-# Kubernetes Setup Functions
+# Resource Names Function
 ################################################################################
-
-# Function to install kubectl
-install_kubectl() {
-    print_section "Installing kubectl"
-    
-    # Remove any existing kubectl installation
-    if command -v kubectl &>/dev/null; then
-        log_info "Removing existing kubectl installation..."
-        sudo apt-get remove -y kubectl &>/dev/null
-    fi
-    
-    # Add Kubernetes repository and key
-    log_info "Adding Kubernetes repository..."
-    sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
-    echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | \
-        sudo tee /etc/apt/sources.list.d/kubernetes.list
-    
-    # Update apt and install kubectl
-    log_info "Installing kubectl..."
-    sudo apt-get update
-    sudo apt-get install -y kubectl
-    
-    # Verify installation
-    if ! command -v kubectl &>/dev/null; then
-        log_error "kubectl installation failed"
-        return 1
-    fi
-    
-    log_success "kubectl installed successfully"
-    kubectl version --client
-    return 0
-}
 
 # Function to get resource names
 get_resource_names() {
@@ -308,67 +323,35 @@ get_resource_names() {
     done
 }
 
-# Function to verify kubeconfig
-verify_kubeconfig() {
-    print_section "Verifying Kubernetes Configuration"
-    
-    # Check if k3s is running
-    if ! systemctl is-active --quiet k3s; then
-        log_info "K3s service not running. Starting k3s..."
-        sudo systemctl start k3s
-        sleep 10  # Wait for k3s to start
-    fi
-    
-    # Ensure k3s.yaml exists
-    if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
-        log_error "k3s configuration file not found at /etc/rancher/k3s/k3s.yaml"
-        return 1
-    fi
-    
-    # Set up kubeconfig
-    mkdir -p ~/.kube
-    sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
-    sudo chown $(id -u):$(id -g) ~/.kube/config
-    chmod 600 ~/.kube/config
-    export KUBECONFIG=~/.kube/config
-    
-    # Verify kubectl can connect
-    if ! kubectl cluster-info &>/dev/null; then
-        log_error "Unable to connect to Kubernetes cluster"
-        return 1
-    fi
-    
-    log_success "Kubernetes configuration verified successfully"
-    return 0
-}
+################################################################################
+# Azure Arc Setup Functions
+################################################################################
 
 # Function to setup connected kubernetes
 setup_connectedk8s() {
     print_section "Setting up Connected Kubernetes"
     
-    # Verify kubectl installation
-    if ! command -v kubectl &>/dev/null; then
-        log_info "kubectl not found, installing..."
-        if ! install_kubectl; then
-            log_error "Failed to install kubectl"
-            return 1
-        fi
-    fi
-    
-    # Verify kubeconfig
-    if ! verify_kubeconfig; then
-        log_error "Failed to verify Kubernetes configuration"
+    # Verify kubernetes prerequisites
+    if ! verify_kubernetes_prereqs; then
+        log_error "Failed to verify Kubernetes prerequisites"
         return 1
     fi
     
-    # Add extension if not present
+    # Add/update Arc extension
     if ! az extension show --name connectedk8s &>/dev/null; then
-        log_info "Adding connectedk8s extension..."
-        if ! az extension add --upgrade --name connectedk8s; then
-            log_error "Failed to add connectedk8s extension"
+        log_info "Installing Azure Arc extension..."
+        if ! az extension add --name connectedk8s --version 1.9.3 --yes; then
+            log_error "Failed to install Azure Arc extension"
+            return 1
+        fi
+    else
+        log_info "Updating Azure Arc extension..."
+        if ! az extension update --name connectedk8s; then
+            log_error "Failed to update Azure Arc extension"
             return 1
         fi
     fi
+    log_success "Azure Arc extension is ready"
     
     # Connect cluster
     log_info "Connecting cluster to Azure Arc..."
@@ -399,9 +382,9 @@ setup_connectedk8s() {
     return 0
 }
 
-# Function to configure k3s
-configure_k3s() {
-    print_section "Configuring k3s"
+# Function to configure k3s OIDC
+configure_k3s_oidc() {
+    print_section "Configuring K3s OIDC"
     
     if [ -z "$ISSUER_URL_ID" ]; then
         log_error "OIDC Issuer URL not available"
@@ -415,7 +398,7 @@ configure_k3s() {
     fi
     
     # Update k3s configuration
-    log_info "Updating k3s configuration..."
+    log_info "Updating k3s configuration for OIDC..."
     {
         echo "kube-apiserver-arg:"
         echo " - service-account-issuer=$ISSUER_URL_ID"
@@ -446,7 +429,7 @@ configure_k3s() {
         return 1
     fi
     
-    log_success "k3s configuration completed"
+    log_success "K3s OIDC configuration completed"
     return 0
 }
 ################################################################################
@@ -546,7 +529,7 @@ create_azure_resources() {
 }
 
 ################################################################################
-# Summary and Configuration Functions
+# Summary Function
 ################################################################################
 
 # Function to print summary
@@ -584,29 +567,31 @@ export ISSUER_URL_ID="$ISSUER_URL_ID"
 EOF
     log_success "Configuration saved to azure_config.env"
 }
-
 ################################################################################
 # Main Execution
 ################################################################################
 
 main() {
-    log_info "Starting Azure setup script..."
+    log_info "Starting Azure Arc and resource setup..."
     
-    # Check if running as root
+    # Initial checks
     if is_root; then
         log_error "Please run this script as a normal user (not root)"
         log_info "The script will ask for sudo password when needed"
         exit 1
     fi
     
-    # Get sudo privileges early but don't use them yet
+    # Get sudo privileges early
     check_sudo_privileges || exit 1
     
-    # Azure authentication (as normal user)
-    check_azure_login || exit 1
-    get_subscription || exit 1
-    check_resource_group || exit 1
-    get_resource_names || exit 1
+    # Verify kubernetes prerequisites
+    time_action "Verify Kubernetes" verify_kubernetes_prereqs || exit 1
+    
+    # Azure authentication and setup
+    time_action "Azure Login" check_azure_login || exit 1
+    time_action "Get Subscription" get_subscription || exit 1
+    time_action "Check Resource Group" check_resource_group || exit 1
+    time_action "Get Resource Names" get_resource_names || exit 1
     
     # Show configuration before proceeding
     print_section "Configuration to be applied"
@@ -620,17 +605,10 @@ main() {
     read -p "Press Enter to continue or Ctrl+C to cancel..."
     
     # Execute operations with appropriate privileges
-    log_info "Step 1/4: Registering Azure providers"
-    register_providers || exit 1
-    
-    log_info "Step 2/4: Setting up connected Kubernetes"
-    setup_connectedk8s || exit 1
-    
-    log_info "Step 3/4: Configuring k3s"
-    configure_k3s || exit 1
-    
-    log_info "Step 4/4: Creating Azure resources"
-    create_azure_resources || exit 1
+    time_action "Register Providers" register_providers || exit 1
+    time_action "Setup Connected K8s" setup_connectedk8s || exit 1
+    time_action "Configure K3s OIDC" configure_k3s_oidc || exit 1
+    time_action "Create Azure Resources" create_azure_resources || exit 1
     
     # Print summary
     print_summary
