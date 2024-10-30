@@ -494,19 +494,18 @@ register_providers() {
     return 0
 }
 ################################################################################
-# Azure Resource Handling Functions
+# Resource Creation Functions
 ################################################################################
 
 # Function to handle resource naming conflicts
 handle_resource_conflict() {
-    local resource_type="$1"  # 'akv' or 'storage'
+    local resource_type="$1"
     local current_name="$2"
     local resource_group="$3"
-    local existing_resource_group
+    local existing_resource_group=""
 
     print_section "Handling $resource_type name conflict"
     
-    # Get the resource group of the existing resource
     if [ "$resource_type" = "akv" ]; then
         existing_resource_group=$(az keyvault show --name "$current_name" --query resourceGroup -o tsv 2>/dev/null)
     else
@@ -584,10 +583,6 @@ generate_random_name() {
     return 1
 }
 
-################################################################################
-# Azure Resource Creation Functions
-################################################################################
-
 # Function to create Azure resources
 create_azure_resources() {
     print_section "Creating Azure Resources"
@@ -611,7 +606,7 @@ create_azure_resources() {
             if [ -z "$AKV_ID" ] || [ "$AKV_ID" = "null" ]; then
                 log_error "Failed to get Key Vault ID"
                 return 1
-            }
+            fi
             log_success "Key Vault $AKV_NAME created successfully"
         else
             if echo "$kvResult" | grep -q "already exists"; then
@@ -633,7 +628,6 @@ create_azure_resources() {
                         ;;
                     *)
                         AKV_NAME="$action"
-                        continue
                         ;;
                 esac
             else
@@ -677,7 +671,6 @@ create_azure_resources() {
                         ;;
                     *)
                         STORAGE_NAME="$action"
-                        continue
                         ;;
                 esac
             else
@@ -714,7 +707,7 @@ print_summary() {
     for action in "${!ACTION_TIMES[@]}"; do
         printf "%-40s: %d seconds\n" "$action" "${ACTION_TIMES[$action]}"
     done
-    echo -e "Total Execution Time: $total_time seconds"
+    echo -e "\nTotal Execution Time: $total_time seconds"
     
     # Save configuration
     cat > azure_config.env << EOF
