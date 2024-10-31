@@ -9,6 +9,7 @@
 #
 # Features:
 # - Automated Azure Arc enablement for K3s clusters
+# - Automated Key Vault creation with smart naming
 # - Smart resource naming with conflict resolution
 # - Flexible options for existing resources
 # - Comprehensive error handling and logging
@@ -178,6 +179,63 @@ verify_kubernetes_prereqs() {
     return 0
 }
 
+# Function to check if cluster is already Arc-enabled
+check_existing_arc_cluster() {
+    local resource_group="$1"
+    
+    log_info "Checking for existing Arc-enabled cluster..."
+    
+    # List all Arc clusters in the resource group
+    local clusters
+    clusters=$(az connectedk8s list -g "$resource_group" --query "[].name" -o tsv)
+    
+    if [ $? -eq 0 ] && [ -n "$clusters" ]; then
+        log_info "Found existing Arc-enabled clusters in resource group $resource_group:"
+        az connectedk8s list -g "$resource_group" --query "[].{Name:name, State:provisioningState}" -o table
+        
+        read -p "Would you like to use an existing cluster? (Y/n): " use_existing
+        if [[ -z "$use_existing" || "${use_existing,,}" == "y"* ]]; then
+            # If there's only one cluster, use it automatically
+            if [ $(echo "$clusters" | wc -l) -eq 1 ]; then
+                CLUSTER_NAME=$clusters
+                log_info "Using existing cluster: $CLUSTER_NAME"
+            else
+                # Let user select from available clusters
+                echo "Available clusters:"
+                local i=1
+                local cluster_array=()
+                while IFS= read -r cluster; do
+                    echo "$i) $cluster"
+                    cluster_array+=("$cluster")
+                    ((i++))
+                done <<< "$clusters"
+                
+                while true; do
+                    read -p "Enter cluster number (1-${#cluster_array[@]}): " selection
+                    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#cluster_array[@]}" ]; then
+                        CLUSTER_NAME="${cluster_array[$((selection-1))]}"
+                        break
+                    else
+                        log_error "Invalid selection. Please try again."
+                    fi
+                done
+            fi
+            
+            # Get OIDC Issuer URL for the selected cluster
+            ISSUER_URL_ID=$(az connectedk8s show \
+                --resource-group "$resource_group" \
+                --name "$CLUSTER_NAME" \
+                --query oidcIssuerProfile.issuerUrl \
+                --output tsv)
+            
+            if [ -n "$ISSUER_URL_ID" ]; then
+                log_success "Using existing Arc cluster: $CLUSTER_NAME"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
 ################################################################################
 # Azure Authentication Functions
 ################################################################################
@@ -216,6 +274,7 @@ check_azure_login() {
     az account show --query "{Subscription:name,UserName:user.name,TenantID:tenantId}" -o table
     return 0
 }
+
 ################################################################################
 # Subscription Management Functions
 ################################################################################
@@ -250,7 +309,7 @@ get_subscription() {
 }
 
 ################################################################################
-# Resource Group Management Functions
+# Resource Management Functions
 ################################################################################
 
 # Function to check resource group existence and location
@@ -292,6 +351,14 @@ get_location() {
     done
 }
 
+# Function to generate a valid Key Vault name
+generate_akv_name() {
+    local base="lab460"
+    local chars="abcdefghijklmnopqrstuvwxyz0123456789"
+    local suffix=$(printf "%04d" $((RANDOM % 10000)))
+    echo "${base}${suffix}kv"
+}
+
 # Function to get resource names
 get_resource_names() {
     print_section "Getting Resource Names"
@@ -315,17 +382,6 @@ get_resource_names() {
             break
         else
             log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
-        fi
-    done
-    
-    # Get key vault name
-    while true; do
-        read -p "Enter key vault base name: " kv_base
-        AKV_NAME=$(format_text "${kv_base}akv")
-        if [[ $AKV_NAME =~ ^[a-z0-9-]{3,24}$ ]]; then
-            break
-        else
-            log_error "Invalid key vault name. Use 3-24 lowercase letters, numbers, and hyphens."
         fi
     done
 }
@@ -497,30 +553,65 @@ register_providers() {
 # Resource Creation Functions
 ################################################################################
 
-# Function to handle resource naming conflicts
-handle_resource_conflict() {
-    local resource_type="$1"
-    local current_name="$2"
-    local resource_group="$3"
+# Function to create Key Vault with auto-generated name
+create_keyvault() {
+    local resource_group="$1"
+    local max_attempts=5
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        AKV_NAME=$(generate_akv_name)
+        log_info "Attempt $attempt/$max_attempts: Trying to create Key Vault with name: $AKV_NAME"
+        
+        local kvResult
+        kvResult=$(az keyvault create \
+            --enable-rbac-authorization \
+            --name "$AKV_NAME" \
+            --resource-group "$resource_group" \
+            --output json 2>&1)
+        
+        if [ $? -eq 0 ]; then
+            AKV_ID=$(echo "$kvResult" | jq -r '.id // empty')
+            if [ -z "$AKV_ID" ] || [ "$AKV_ID" = "null" ]; then
+                AKV_ID=$(az keyvault show --name "$AKV_NAME" --query id -o tsv)
+            fi
+            log_success "Key Vault created successfully:"
+            echo "  Name: $AKV_NAME"
+            echo "  ID: $AKV_ID"
+            return 0
+        else
+            if ! echo "$kvResult" | grep -q "already exists"; then
+                log_error "Failed to create Key Vault with unexpected error: $kvResult"
+                return 1
+            fi
+            log_warning "Name $AKV_NAME is already in use, generating new name..."
+            ((attempt++))
+        fi
+    done
+    
+    log_error "Failed to create Key Vault after $max_attempts attempts"
+    return 1
+}
+
+# Function to handle resource conflict for Storage Account
+handle_storage_conflict() {
+    local current_name="$1"
+    local resource_group="$2"
     local existing_resource_group=""
 
-    print_section "Handling $resource_type name conflict"
+    print_section "Handling Storage Account name conflict"
     
-    if [ "$resource_type" = "akv" ]; then
-        existing_resource_group=$(az keyvault show --name "$current_name" --query resourceGroup -o tsv 2>/dev/null)
-    else
-        existing_resource_group=$(az storage account show --name "$current_name" --query resourceGroup -o tsv 2>/dev/null)
-    fi
+    existing_resource_group=$(az storage account show --name "$current_name" --query resourceGroup -o tsv 2>/dev/null)
 
     if [ "$existing_resource_group" = "$resource_group" ]; then
-        log_info "A $resource_type with name '$current_name' exists in the same resource group."
-        read -p "Do you want to use the existing $resource_type? (Y/n): " use_existing
+        log_info "A storage account with name '$current_name' exists in the same resource group."
+        read -p "Do you want to use the existing storage account? (Y/n): " use_existing
         if [[ -z "$use_existing" || "${use_existing,,}" == "y"* ]]; then
             echo "USE_EXISTING"
             return 0
         fi
     else
-        log_info "A $resource_type with name '$current_name' exists in a different resource group."
+        log_info "A storage account with name '$current_name' exists in a different resource group."
     fi
 
     while true; do
@@ -531,29 +622,16 @@ handle_resource_conflict() {
 
         case $choice in
             1)
-                if [ "$resource_type" = "akv" ]; then
-                    while true; do
-                        read -p "Enter new key vault base name: " kv_base
-                        new_name=$(format_text "${kv_base}akv")
-                        if [[ $new_name =~ ^[a-z0-9-]{3,24}$ ]]; then
-                            break
-                        else
-                            log_error "Invalid key vault name. Use 3-24 lowercase letters, numbers, and hyphens."
-                        fi
-                    done
-                else
-                    while true; do
-                        read -p "Enter new storage account base name: " storage_base
-                        new_name=$(format_text "${storage_base}st")
-                        if [[ $new_name =~ ^[a-z0-9]{3,24}$ ]]; then
-                            break
-                        else
-                            log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
-                        fi
-                    done
-                fi
-                echo "$new_name"
-                return 0
+                while true; do
+                    read -p "Enter new storage account base name: " storage_base
+                    new_name=$(format_text "${storage_base}st")
+                    if [[ $new_name =~ ^[a-z0-9]{3,24}$ ]]; then
+                        echo "$new_name"
+                        return 0
+                    else
+                        log_error "Invalid storage account name. Use 3-24 lowercase letters and numbers."
+                    fi
+                done
                 ;;
             2)
                 echo "GENERATE_RANDOM"
@@ -566,8 +644,8 @@ handle_resource_conflict() {
     done
 }
 
-# Function to generate random name
-generate_random_name() {
+# Function to generate random storage name
+generate_random_storage_name() {
     local base_name="$1"
     local max_attempts="$2"
     local attempt=1
@@ -588,63 +666,14 @@ create_azure_resources() {
     print_section "Creating Azure Resources"
     local max_attempts=5
     
-    # Handle Key Vault creation
-    local success=false
-    local original_akv_name="$AKV_NAME"
-    
-    while [ "$success" = false ]; do
-        log_info "Attempting to create Key Vault $AKV_NAME..."
-        local kvResult
-        kvResult=$(az keyvault create \
-            --enable-rbac-authorization \
-            --name "$AKV_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --output json 2>&1)
-        
-        if [ $? -eq 0 ]; then
-            success=true
-            # Extract ID from the correct JSON path
-            AKV_ID=$(echo "$kvResult" | jq -r '.id // empty')
-            if [ -z "$AKV_ID" ]; then
-                # If .id is empty, try the full resource ID path
-                AKV_ID="/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.KeyVault/vaults/$AKV_NAME"
-                if ! az keyvault show --name "$AKV_NAME" --query id -o tsv &>/dev/null; then
-                    log_error "Failed to get Key Vault ID and couldn't verify vault existence"
-                    return 1
-                fi
-            fi
-            log_success "Key Vault $AKV_NAME created successfully with ID: $AKV_ID"
-        else
-            if echo "$kvResult" | grep -q "already exists"; then
-                local action=$(handle_resource_conflict "akv" "$AKV_NAME" "$RESOURCE_GROUP")
-                case $action in
-                    "USE_EXISTING")
-                        AKV_ID=$(az keyvault show --name "$AKV_NAME" --query id -o tsv)
-                        log_success "Using existing Key Vault $AKV_NAME"
-                        success=true
-                        ;;
-                    "GENERATE_RANDOM")
-                        for new_name in $(generate_random_name "$original_akv_name" $max_attempts); do
-                            AKV_NAME="$new_name"
-                            log_info "Trying with generated name: $AKV_NAME"
-                            continue 2
-                        done
-                        log_error "Failed to find available Key Vault name after $max_attempts attempts"
-                        return 1
-                        ;;
-                    *)
-                        AKV_NAME="$action"
-                        ;;
-                esac
-            else
-                log_error "Failed to create Key Vault: $kvResult"
-                return 1
-            fi
-        fi
-    done
+    # Create Key Vault with auto-generated name
+    log_info "Creating Key Vault..."
+    if ! create_keyvault "$RESOURCE_GROUP"; then
+        return 1
+    fi
 
     # Handle Storage Account creation
-    success=false
+    local success=false
     local original_storage_name="$STORAGE_NAME"
     
     while [ "$success" = false ]; do
@@ -660,20 +689,29 @@ create_azure_resources() {
             log_success "Storage Account $STORAGE_NAME created successfully"
         else
             if echo "$stResult" | grep -q "already exists"; then
-                local action=$(handle_resource_conflict "storage" "$STORAGE_NAME" "$RESOURCE_GROUP")
+                local action=$(handle_storage_conflict "$STORAGE_NAME" "$RESOURCE_GROUP")
                 case $action in
                     "USE_EXISTING")
                         log_success "Using existing Storage Account $STORAGE_NAME"
                         success=true
                         ;;
                     "GENERATE_RANDOM")
-                        for new_name in $(generate_random_name "$original_storage_name" $max_attempts); do
+                        for new_name in $(generate_random_storage_name "$original_storage_name" $max_attempts); do
                             STORAGE_NAME="$new_name"
                             log_info "Trying with generated name: $STORAGE_NAME"
-                            continue 2
+                            if az storage account create \
+                                --name "$STORAGE_NAME" \
+                                --resource-group "$RESOURCE_GROUP" \
+                                --enable-hierarchical-namespace &>/dev/null; then
+                                success=true
+                                log_success "Storage Account $STORAGE_NAME created successfully"
+                                break
+                            fi
                         done
-                        log_error "Failed to find available Storage Account name after $max_attempts attempts"
-                        return 1
+                        if [ "$success" = false ]; then
+                            log_error "Failed to find available Storage Account name after $max_attempts attempts"
+                            return 1
+                        fi
                         ;;
                     *)
                         STORAGE_NAME="$action"
@@ -753,7 +791,15 @@ main() {
     time_action "Azure Login" check_azure_login || exit 1
     time_action "Get Subscription" get_subscription || exit 1
     time_action "Check Resource Group" check_resource_group || exit 1
-    time_action "Get Resource Names" get_resource_names || exit 1
+    
+    # Check for existing Arc cluster
+    local skip_arc=false
+    if check_existing_arc_cluster "$RESOURCE_GROUP"; then
+        skip_arc=true
+        log_info "Using existing Arc-enabled cluster"
+    else
+        time_action "Get Resource Names" get_resource_names || exit 1
+    fi
     
     # Show configuration before proceeding
     print_section "Configuration to be applied"
@@ -761,15 +807,17 @@ main() {
     echo "Location: $LOCATION"
     echo "Subscription ID: $SUBSCRIPTION_ID"
     echo "Cluster Name: $CLUSTER_NAME"
-    echo "Storage Account: $STORAGE_NAME"
-    echo "Key Vault: $AKV_NAME"
     
     read -p "Press Enter to continue or Ctrl+C to cancel..."
     
     # Execute operations with appropriate privileges
     time_action "Register Providers" register_providers || exit 1
-    time_action "Setup Connected K8s" setup_connectedk8s || exit 1
-    time_action "Configure K3s OIDC" configure_k3s_oidc || exit 1
+    
+    if [ "$skip_arc" != "true" ]; then
+        time_action "Setup Connected K8s" setup_connectedk8s || exit 1
+        time_action "Configure K3s OIDC" configure_k3s_oidc || exit 1
+    fi
+    
     time_action "Create Azure Resources" create_azure_resources || exit 1
     
     # Print summary
