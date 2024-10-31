@@ -4,20 +4,21 @@
 # Azure Arc Resource Setup Script
 #
 # This script automates the setup of Azure Arc-enabled Kubernetes cluster and
-# retrieves existing Azure resource information.
-# Assumes K3s is already installed and configured.
+# retrieves existing Azure resource information. It generates an automatic name
+# for the Arc cluster and stores all resource information for future use.
 #
 # Features:
 # - Automated Azure Arc enablement for K3s clusters
+# - Automatic Arc cluster name generation
 # - Retrieval of existing Key Vault and Storage Account IDs
-# - Automatic detection of existing Arc clusters
 # - Comprehensive error handling and logging
+# - Configuration export for subsequent scripts
 #
 # Requirements:
 # - Run as a normal user (not root)
 # - Sudo privileges available for system operations
 # - K3s already installed and running
-# - Azure CLI installed
+# - Azure CLI installed with required extensions
 # - kubectl and jq commands available
 # - Existing Key Vault and Storage Account in the resource group
 ################################################################################
@@ -33,11 +34,13 @@ readonly NC='\033[0m' # No Color
 readonly SCRIPT_START_TIME=$(date +%s)
 readonly RESOURCE_GROUP="LAB460"  # Fixed resource group name
 
-# Resource IDs (will be populated)
+# Resource IDs and names (will be populated)
 AKV_ID=""
 AKV_NAME=""
 ST_ID=""
 ST_NAME=""
+CLUSTER_NAME=""
+ISSUER_URL_ID=""
 
 # Arrays to track status
 declare -A ACTION_TIMES
@@ -102,44 +105,11 @@ is_root() {
     [ "$(id -u)" -eq 0 ]
 }
 
-# Function to get existing resource IDs
-get_existing_resource_ids() {
-    local resource_group="$1"
-    print_section "Getting Existing Resource IDs"
-    
-    # Get Key Vault information
-    log_info "Looking for existing Key Vault..."
-    local kv_list
-    kv_list=$(az keyvault list -g "$resource_group" --query "[].{name:name, id:id}" -o json)
-    
-    if [ -n "$kv_list" ] && [ "$kv_list" != "[]" ]; then
-        # Get the first Key Vault if multiple exist
-        AKV_NAME=$(echo "$kv_list" | jq -r '.[0].name')
-        AKV_ID=$(echo "$kv_list" | jq -r '.[0].id')
-        log_success "Found Key Vault: $AKV_NAME"
-        log_info "Key Vault ID: $AKV_ID"
-    else
-        log_error "No Key Vault found in resource group $resource_group"
-        return 1
-    fi
-    
-    # Get Storage Account information
-    log_info "Looking for existing Storage Account..."
-    local st_list
-    st_list=$(az storage account list -g "$resource_group" --query "[].{name:name, id:id}" -o json)
-    
-    if [ -n "$st_list" ] && [ "$st_list" != "[]" ]; then
-        # Get the first Storage Account if multiple exist
-        ST_NAME=$(echo "$st_list" | jq -r '.[0].name')
-        ST_ID=$(echo "$st_list" | jq -r '.[0].id')
-        log_success "Found Storage Account: $ST_NAME"
-        log_info "Storage Account ID: $ST_ID"
-    else
-        log_error "No Storage Account found in resource group $resource_group"
-        return 1
-    fi
-    
-    return 0
+# Function to generate Arc cluster name
+generate_arc_name() {
+    local base="lab460"
+    local random_num=$(printf "%04d" $((RANDOM % 10000)))
+    echo "${base}${random_num}arc"
 }
 ################################################################################
 # Privilege Management Functions
@@ -220,67 +190,57 @@ verify_kubernetes_prereqs() {
         log_error "Unable to connect to Kubernetes cluster"
         return 1
     fi
+    
+    # Get cluster details for logging
+    local node_count=$(kubectl get nodes --no-headers | wc -l)
+    local k8s_version=$(kubectl version --output=json | jq -r '.serverVersion.gitVersion')
+    
     log_success "Successfully connected to Kubernetes cluster"
+    log_info "Cluster details:"
+    echo "  Nodes: $node_count"
+    echo "  Kubernetes version: $k8s_version"
     
     return 0
 }
 
-# Function to check if cluster is already Arc-enabled
-check_existing_arc_cluster() {
+# Function to get existing resource IDs
+get_existing_resource_ids() {
     local resource_group="$1"
+    print_section "Getting Existing Resource IDs"
     
-    log_info "Checking for existing Arc-enabled cluster..."
+    # Get Key Vault information
+    log_info "Looking for existing Key Vault..."
+    local kv_list
+    kv_list=$(az keyvault list -g "$resource_group" --query "[].{name:name, id:id}" -o json)
     
-    # List all Arc clusters in the resource group
-    local clusters
-    clusters=$(az connectedk8s list -g "$resource_group" --query "[].name" -o tsv)
-    
-    if [ $? -eq 0 ] && [ -n "$clusters" ]; then
-        log_info "Found existing Arc-enabled clusters in resource group $resource_group:"
-        az connectedk8s list -g "$resource_group" --query "[].{Name:name, State:provisioningState}" -o table
-        
-        read -p "Would you like to use an existing cluster? (Y/n): " use_existing
-        if [[ -z "$use_existing" || "${use_existing,,}" == "y"* ]]; then
-            # If there's only one cluster, use it automatically
-            if [ $(echo "$clusters" | wc -l) -eq 1 ]; then
-                CLUSTER_NAME=$clusters
-                log_info "Using existing cluster: $CLUSTER_NAME"
-            else
-                # Let user select from available clusters
-                echo "Available clusters:"
-                local i=1
-                local cluster_array=()
-                while IFS= read -r cluster; do
-                    echo "$i) $cluster"
-                    cluster_array+=("$cluster")
-                    ((i++))
-                done <<< "$clusters"
-                
-                while true; do
-                    read -p "Enter cluster number (1-${#cluster_array[@]}): " selection
-                    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#cluster_array[@]}" ]; then
-                        CLUSTER_NAME="${cluster_array[$((selection-1))]}"
-                        break
-                    else
-                        log_error "Invalid selection. Please try again."
-                    fi
-                done
-            fi
-            
-            # Get OIDC Issuer URL for the selected cluster
-            ISSUER_URL_ID=$(az connectedk8s show \
-                --resource-group "$resource_group" \
-                --name "$CLUSTER_NAME" \
-                --query oidcIssuerProfile.issuerUrl \
-                --output tsv)
-            
-            if [ -n "$ISSUER_URL_ID" ]; then
-                log_success "Using existing Arc cluster: $CLUSTER_NAME"
-                return 0
-            fi
-        fi
+    if [ -n "$kv_list" ] && [ "$kv_list" != "[]" ]; then
+        # Get the first Key Vault if multiple exist
+        AKV_NAME=$(echo "$kv_list" | jq -r '.[0].name')
+        AKV_ID=$(echo "$kv_list" | jq -r '.[0].id')
+        log_success "Found Key Vault: $AKV_NAME"
+        log_info "Key Vault ID: $AKV_ID"
+    else
+        log_error "No Key Vault found in resource group $resource_group"
+        return 1
     fi
-    return 1
+    
+    # Get Storage Account information
+    log_info "Looking for existing Storage Account..."
+    local st_list
+    st_list=$(az storage account list -g "$resource_group" --query "[].{name:name, id:id}" -o json)
+    
+    if [ -n "$st_list" ] && [ "$st_list" != "[]" ]; then
+        # Get the first Storage Account if multiple exist
+        ST_NAME=$(echo "$st_list" | jq -r '.[0].name')
+        ST_ID=$(echo "$st_list" | jq -r '.[0].id')
+        log_success "Found Storage Account: $ST_NAME"
+        log_info "Storage Account ID: $ST_ID"
+    else
+        log_error "No Storage Account found in resource group $resource_group"
+        return 1
+    fi
+    
+    return 0
 }
 ################################################################################
 # Azure Authentication Functions
@@ -367,6 +327,17 @@ check_resource_group() {
     if az group show --name "$RESOURCE_GROUP" &>/dev/null; then
         LOCATION=$(az group show --name "$RESOURCE_GROUP" --query location -o tsv)
         log_success "Found existing resource group $RESOURCE_GROUP in location: $LOCATION"
+        
+        # Get additional resource group details for logging
+        local tags=$(az group show --name "$RESOURCE_GROUP" --query tags -o json)
+        local resource_count=$(az resource list --resource-group "$RESOURCE_GROUP" --query "length(@)")
+        
+        log_info "Resource group details:"
+        echo "  Location: $LOCATION"
+        echo "  Resource count: $resource_count"
+        if [ "$tags" != "{}" ] && [ "$tags" != "null" ]; then
+            echo "  Tags: $tags"
+        fi
         return 0
     else
         log_warning "Resource group $RESOURCE_GROUP not found"
@@ -376,6 +347,7 @@ check_resource_group() {
             log_error "Failed to create resource group"
             return 1
         fi
+        log_success "Resource group created successfully"
     fi
 }
 
@@ -390,24 +362,10 @@ get_location() {
         read -p "Enter Azure location: " LOCATION
         LOCATION=$(format_text "$LOCATION")
         if az account list-locations --query "[?name=='$LOCATION']" --output tsv &>/dev/null; then
+            log_success "Selected location: $LOCATION"
             break
         else
             log_error "Invalid location. Please try again."
-        fi
-    done
-}
-
-# Function to get cluster name if needed
-get_cluster_name() {
-    print_section "Getting Cluster Name"
-    
-    while true; do
-        read -p "Enter cluster name (lowercase, no spaces): " CLUSTER_NAME
-        CLUSTER_NAME=$(format_text "$CLUSTER_NAME")
-        if [[ $CLUSTER_NAME =~ ^[a-z][a-z0-9-]{0,61}[a-z0-9]$ ]]; then
-            break
-        else
-            log_error "Invalid cluster name. Use lowercase letters, numbers, and hyphens."
         fi
     done
 }
@@ -419,6 +377,10 @@ get_cluster_name() {
 setup_connectedk8s() {
     print_section "Setting up Connected Kubernetes"
     
+    # Generate Arc cluster name
+    CLUSTER_NAME=$(generate_arc_name)
+    log_info "Generated Arc cluster name: $CLUSTER_NAME"
+    
     # Verify kubernetes prerequisites
     if ! verify_kubernetes_prereqs; then
         log_error "Failed to verify Kubernetes prerequisites"
@@ -427,6 +389,11 @@ setup_connectedk8s() {
     
     # Connect cluster
     log_info "Connecting cluster to Azure Arc..."
+    log_info "Using configuration:"
+    echo "  Cluster Name: $CLUSTER_NAME"
+    echo "  Resource Group: $RESOURCE_GROUP"
+    echo "  Location: $LOCATION"
+    
     if ! az connectedk8s connect \
         --name "$CLUSTER_NAME" \
         -l "$LOCATION" \
@@ -439,6 +406,7 @@ setup_connectedk8s() {
     fi
     
     # Get OIDC Issuer URL
+    log_info "Retrieving OIDC Issuer URL..."
     ISSUER_URL_ID=$(az connectedk8s show \
         --resource-group "$RESOURCE_GROUP" \
         --name "$CLUSTER_NAME" \
@@ -451,6 +419,7 @@ setup_connectedk8s() {
     fi
     
     log_success "Successfully connected to Azure Arc"
+    log_info "OIDC Issuer URL: $ISSUER_URL_ID"
     return 0
 }
 
@@ -471,6 +440,7 @@ configure_k3s_oidc() {
     
     # Update k3s configuration
     log_info "Updating k3s configuration for OIDC..."
+    log_info "Setting service account issuer to: $ISSUER_URL_ID"
     {
         echo "kube-apiserver-arg:"
         echo " - service-account-issuer=$ISSUER_URL_ID"
@@ -501,7 +471,12 @@ configure_k3s_oidc() {
         return 1
     fi
     
+    # Verify OIDC configuration
+    log_info "Verifying OIDC configuration..."
+    local node_status=$(kubectl get nodes -o wide)
     log_success "K3s OIDC configuration completed"
+    log_info "Current node status:"
+    echo "$node_status"
     return 0
 }
 
@@ -521,6 +496,8 @@ register_providers() {
         "Microsoft.DeviceRegistry"
         "Microsoft.SecretSyncController"
     )
+    
+    log_info "Starting provider registration check for ${#providers[@]} providers"
     
     for provider in "${providers[@]}"; do
         log_info "Checking provider: $provider"
@@ -551,8 +528,9 @@ register_providers() {
                 log_error "Provider $provider failed to register in time"
                 return 1
             fi
+            log_success "Provider $provider registered successfully"
         else
-            log_info "$provider already registered"
+            log_success "$provider already registered"
         fi
     done
     
@@ -570,11 +548,16 @@ print_summary() {
     
     print_section "Execution Summary"
     
-    echo -e "\n${GREEN}Configuration:${NC}"
+    echo -e "\n${GREEN}Resource Configuration:${NC}"
     echo "Resource Group: $RESOURCE_GROUP"
     echo "Location: $LOCATION"
     echo "Subscription ID: $SUBSCRIPTION_ID"
+    
+    echo -e "\n${GREEN}Arc Configuration:${NC}"
     echo "Cluster Name: $CLUSTER_NAME"
+    echo "OIDC Issuer URL: $ISSUER_URL_ID"
+    
+    echo -e "\n${GREEN}Existing Resources:${NC}"
     echo "Key Vault Name: $AKV_NAME"
     echo "Key Vault ID: $AKV_ID"
     echo "Storage Account Name: $ST_NAME"
@@ -586,17 +569,25 @@ print_summary() {
     done
     echo -e "\nTotal Execution Time: $total_time seconds"
     
-    # Save configuration
+    # Save configuration for future use
+    log_info "Saving configuration to azure_config.env..."
     cat > azure_config.env << EOF
+# Azure Arc Configuration - Generated on $(date)
 export SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
 export LOCATION="$LOCATION"
 export RESOURCE_GROUP="$RESOURCE_GROUP"
 export CLUSTER_NAME="$CLUSTER_NAME"
+export ISSUER_URL_ID="$ISSUER_URL_ID"
+
+# Existing Resource IDs
 export AKV_NAME="$AKV_NAME"
 export AKV_ID="$AKV_ID"
 export ST_NAME="$ST_NAME"
 export ST_ID="$ST_ID"
-export ISSUER_URL_ID="$ISSUER_URL_ID"
+
+# Script Execution Information
+export SCRIPT_EXECUTION_TIME="$total_time"
+export SCRIPT_EXECUTION_DATE="$(date)"
 EOF
     log_success "Configuration saved to azure_config.env"
 }
@@ -629,21 +620,11 @@ main() {
     # Get existing resource IDs
     time_action "Get Resource IDs" get_existing_resource_ids "$RESOURCE_GROUP" || exit 1
     
-    # Check for existing Arc cluster
-    local skip_arc=false
-    if check_existing_arc_cluster "$RESOURCE_GROUP"; then
-        skip_arc=true
-        log_info "Using existing Arc-enabled cluster"
-    else
-        time_action "Get Cluster Name" get_cluster_name || exit 1
-    fi
-    
     # Show configuration before proceeding
     print_section "Configuration to be applied"
     echo "Resource Group: $RESOURCE_GROUP"
     echo "Location: $LOCATION"
     echo "Subscription ID: $SUBSCRIPTION_ID"
-    echo "Cluster Name: $CLUSTER_NAME"
     echo "Key Vault: $AKV_NAME"
     echo "Storage Account: $ST_NAME"
     
@@ -651,17 +632,15 @@ main() {
     
     # Execute operations with appropriate privileges
     time_action "Register Providers" register_providers || exit 1
-    
-    if [ "$skip_arc" != "true" ]; then
-        time_action "Setup Connected K8s" setup_connectedk8s || exit 1
-        time_action "Configure K3s OIDC" configure_k3s_oidc || exit 1
-    fi
+    time_action "Setup Connected K8s" setup_connectedk8s || exit 1
+    time_action "Configure K3s OIDC" configure_k3s_oidc || exit 1
     
     # Print summary
     print_summary
     
     log_success "Setup completed successfully!"
     log_info "To load the configuration in a new session, run: source azure_config.env"
+    log_info "Configuration variables are now available for use in other scripts"
 }
 
 ################################################################################
