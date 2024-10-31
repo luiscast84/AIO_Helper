@@ -381,11 +381,10 @@ setup_connectedk8s() {
     CLUSTER_NAME=$(generate_arc_name)
     log_info "Generated Arc cluster name: $CLUSTER_NAME"
     
-    # Verify kubernetes prerequisites
-    if ! verify_kubernetes_prereqs; then
-        log_error "Failed to verify Kubernetes prerequisites"
-        return 1
-    fi
+    # Configure extension settings to avoid prompts
+    log_info "Configuring Azure CLI extension settings..."
+    az config set extension.use_dynamic_install=yes_without_prompt &>/dev/null
+    az config set extension.dynamic_install.allow_preview=true &>/dev/null
     
     # Connect cluster
     log_info "Connecting cluster to Azure Arc..."
@@ -394,13 +393,15 @@ setup_connectedk8s() {
     echo "  Resource Group: $RESOURCE_GROUP"
     echo "  Location: $LOCATION"
     
+    # Use yes flag to accept installation of extensions
     if ! az connectedk8s connect \
         --name "$CLUSTER_NAME" \
         -l "$LOCATION" \
         --resource-group "$RESOURCE_GROUP" \
         --subscription "$SUBSCRIPTION_ID" \
         --enable-oidc-issuer \
-        --enable-workload-identity; then
+        --enable-workload-identity \
+        --yes; then
         log_error "Failed to connect Kubernetes cluster"
         return 1
     fi
