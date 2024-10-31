@@ -264,7 +264,7 @@ check_azure_login() {
     
     # Need to login
     log_info "Azure login required. Opening browser..."
-    if ! az login --use-device-code; then
+    if ! az login; then
         log_error "Azure login failed"
         return 1
     fi
@@ -391,30 +391,7 @@ get_resource_names() {
 
 # Function to setup connected kubernetes
 setup_connectedk8s() {
-    print_section "Setting up Connected Kubernetes"
-    
-    # Verify kubernetes prerequisites
-    if ! verify_kubernetes_prereqs; then
-        log_error "Failed to verify Kubernetes prerequisites"
-        return 1
-    fi
-    
-    # Add/update Arc extension
-    if ! az extension show --name connectedk8s &>/dev/null; then
-        log_info "Installing Azure Arc extension..."
-        if ! az extension add --name connectedk8s --version 1.9.3 --yes; then
-            log_error "Failed to install Azure Arc extension"
-            return 1
-        fi
-    else
-        log_info "Updating Azure Arc extension..."
-        if ! az extension update --name connectedk8s; then
-            log_error "Failed to update Azure Arc extension"
-            return 1
-        fi
-    fi
-    log_success "Azure Arc extension is ready"
-    
+    print_section "Setting up Connected Kubernetes"  
     # Connect cluster
     log_info "Connecting cluster to Azure Arc..."
     if ! az connectedk8s connect \
