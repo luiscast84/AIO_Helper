@@ -191,10 +191,10 @@ check_system_requirements
 
 # Update system packages
 print_section "Updating System Packages"
-if sudo apt-get update && sudo apt-get dist-upgrade -y; then
-    track_change "System Update" "Completed successfully"
+if sudo apt-get update; then
+    track_change "APT Update" "Completed successfully"
 else
-    print_error "System update failed"
+    print_error "APT update failed"
     exit 1
 fi
 
