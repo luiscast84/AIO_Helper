@@ -41,6 +41,7 @@ ST_ID=""
 ST_NAME=""
 CLUSTER_NAME=""
 ISSUER_URL_ID=""
+OBJECT_ID=""
 
 # Arrays to track status
 declare -A ACTION_TIMES
@@ -448,6 +449,16 @@ configure_k3s_oidc() {
         echo " - service-account-max-token-expiration=24h"
     } | sudo tee /etc/rancher/k3s/config.yaml > /dev/null
     
+    # Enable features
+    print_section "Enabling Arc Features"
+    OBJECT_ID=$(az ad sp show --id bc313c14-388c-4e7d-a58e-70017303ee3b --query id -o tsv)
+    track_operation "Enable Arc Features" az connectedk8s enable-features \
+        -n $CLUSTER_NAME \
+        -g $RESOURCE_GROUP \
+        --subscription $SUBSCRIPTION_ID \
+        --custom-locations-oid $OBJECT_ID \
+        --features cluster-connect custom-locations
+
     # Restart k3s
     log_info "Restarting k3s..."
     sudo systemctl restart k3s
@@ -557,6 +568,7 @@ print_summary() {
     echo -e "\n${GREEN}Arc Configuration:${NC}"
     echo "Cluster Name: $CLUSTER_NAME"
     echo "OIDC Issuer URL: $ISSUER_URL_ID"
+    echo "Object ID: $OBJECT_ID"
     
     echo -e "\n${GREEN}Existing Resources:${NC}"
     echo "Key Vault Name: $AKV_NAME"
@@ -579,6 +591,7 @@ export LOCATION="$LOCATION"
 export RESOURCE_GROUP="$RESOURCE_GROUP"
 export CLUSTER_NAME="$CLUSTER_NAME"
 export ISSUER_URL_ID="$ISSUER_URL_ID"
+export OBJECT_ID="$OBJECT_ID"
 
 # Existing Resource IDs
 export AKV_NAME="$AKV_NAME"
@@ -628,6 +641,7 @@ main() {
     echo "Subscription ID: $SUBSCRIPTION_ID"
     echo "Key Vault: $AKV_NAME"
     echo "Storage Account: $ST_NAME"
+    echo "Cluster Name: $CLUSTER_NAME"
     
     read -p "Press Enter to continue or Ctrl+C to cancel..."
     
