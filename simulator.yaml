@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cerebral-simulator-config
+data:
+  MQTT_BROKER: "localhost"
+  MQTT_PORT: "1883"
+  MQTT_TOPIC: "iot/devices"
+  REFRIGERATOR_COUNT: "3"
+  SCALE_COUNT: "2"
+  POS_COUNT: "5"
+  SMARTSHELF_COUNT: "3"
+  HVAC_COUNT: "3"
+  LIGHTINGSYSTEM_COUNT: "3"
+  AUTOMATEDCHECKOUT_COUNT: "5"
+  EVENTHUB_CONNECTION_STRING: "https://aiohubns021ef.servicebus.windows.net:443/"
+  ORDERS_EVENTHUB_NAME: ORDERS
+  INVENTORY_EVENTHUB_NAME: INVENTORY
+  HISTORICAL_DATA_DAYS: "1"
+  ORDER_FREQUENCY: "10"
+  PRODUCTS_FILE: "products.json"
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cerebral-simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cerebral-simulator
+  template:
+    metadata:
+      labels:
+        app: cerebral-simulator
+    spec:
+      containers:
+      - name: cerebral-simulator
+        image: saitcho/cerebral_simulator:0.1
+        envFrom: 
+        - configMapRef:
+            name: cerebral-simulator-config
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: cerebral-simulator-service
+  labels:
+    app: cerebral-simulator-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: cerebral-simulator
+  ports:
+    - name: cerebral-metrics
+      protocol: TCP
+      port: 8001
+      targetPort: 8001
