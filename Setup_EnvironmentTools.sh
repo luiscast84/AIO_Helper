@@ -8,7 +8,6 @@
 #   - Package managers (Snapd, Homebrew)
 #   - Monitoring tools (MQTT Explorer)
 # Version: 3.0
-# Author: Luis Castillo Lopez
 # Last Updated: 2024-11-04
 #########################################################################
 
@@ -86,11 +85,11 @@ file_contains() {
 track_change() {
     SYSTEM_CHANGES[$1]="$2"
 }
-
 # Function to check system requirements
 check_system_requirements() {
     print_section "Checking System Requirements"
     
+    # Check disk space
     local required_space=5120  # 5GB in MB
     local available_space=$(df -m / | awk 'NR==2 {print $4}')
     
@@ -100,6 +99,7 @@ check_system_requirements() {
     fi
     print_success "Disk space check passed"
     
+    # Check sudo privileges
     if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
         print_error "Script requires sudo privileges"
         exit 1
@@ -155,6 +155,42 @@ verify_and_load_environment() {
     fi
 }
 
+# Function to print installation summary
+print_summary() {
+    print_section "Installation Summary"
+    
+    # Print successfully installed packages
+    if [ ${#INSTALLED_PACKAGES[@]} -gt 0 ]; then
+        echo -e "${GREEN}Successfully Installed:${NC}"
+        for pkg in "${!INSTALLED_PACKAGES[@]}"; do
+            echo "  ✔ $pkg: ${INSTALLED_PACKAGES[$pkg]}"
+        done
+    fi
+    
+    # Print skipped packages
+    if [ ${#SKIPPED_PACKAGES[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}Skipped (Already Installed):${NC}"
+        for pkg in "${!SKIPPED_PACKAGES[@]}"; do
+            echo "  ↷ $pkg: ${SKIPPED_PACKAGES[$pkg]}"
+        done
+    fi
+    
+    # Print failed installations
+    if [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
+        echo -e "\n${RED}Failed Installations:${NC}"
+        for pkg in "${!FAILED_PACKAGES[@]}"; do
+            echo "  ✖ $pkg: ${FAILED_PACKAGES[$pkg]}"
+        done
+    fi
+    
+    # Print system changes
+    if [ ${#SYSTEM_CHANGES[@]} -gt 0 ]; then
+        echo -e "\n${BLUE}System Changes:${NC}"
+        for change in "${!SYSTEM_CHANGES[@]}"; do
+            echo "  • $change: ${SYSTEM_CHANGES[$change]}"
+        done
+    fi
+}
 # Function to install Git
 install_git() {
     print_section "Installing and Configuring Git"
@@ -245,7 +281,8 @@ install_homebrew() {
         print_info "Homebrew already installed"
     fi
 }
-# Function to install VS Code repository and package
+
+# Function to setup VS Code repository and package
 setup_vscode() {
     print_section "Setting up VS Code Repository"
     if ! command_exists code; then
@@ -284,7 +321,7 @@ Signed-By: /etc/apt/keyrings/microsoft.gpg" | sudo tee /etc/apt/sources.list.d/a
         check_status "Azure CLI" $?
         
         # Install Azure Arc extension
-        az extension add --name connectedk8s
+        az extension add --name connectedk8s --version 1.9.3
         check_status "Azure Arc Extension" $?
         track_change "Azure Arc Extension" "Installed version 1.9.3"
     else
@@ -293,7 +330,7 @@ Signed-By: /etc/apt/keyrings/microsoft.gpg" | sudo tee /etc/apt/sources.list.d/a
         
         # Check and install Arc extension even if Azure CLI exists
         if ! az extension show --name connectedk8s &>/dev/null; then
-            az extension add --name connectedk8s
+            az extension add --name connectedk8s --version 1.9.3
             check_status "Azure Arc Extension" $?
             track_change "Azure Arc Extension" "Installed version 1.9.3"
         else
@@ -302,7 +339,6 @@ Signed-By: /etc/apt/keyrings/microsoft.gpg" | sudo tee /etc/apt/sources.list.d/a
         fi
     fi
 }
-
 # Function to setup and configure K3s
 setup_k3s() {
     print_section "Installing K3s"
@@ -394,29 +430,57 @@ install_mqtt_explorer() {
     print_section "Installing MQTT Explorer"
     if ! dpkg -l | grep -q mqtt-explorer; then
         print_info "Installing MQTT Explorer dependencies"
-        sudo apt-get install -y libgconf-2-4 libatk1.0-0 libatk-bridge2.0-0 libgdk-pixbuf2.0-0 libgtk-3-0 libgbm1 libnss3 libxss1
-        
-        MQTT_EXPLORER_VERSION="0.4.0-beta1"
-        MQTT_DEB="mqtt-explorer_${MQTT_EXPLORER_VERSION}_amd64.deb"
+        # Updated dependencies for Ubuntu 22.04 with specific audio package
+        sudo apt-get install -y \
+            libgtk-3-0 \
+            libnss3 \
+            libxss1 \
+            libxtst6 \
+            xdg-utils \
+            libatspi2.0-0 \
+            libsecret-1-0 \
+            libgbm1 \
+            libasound2t64 \
+            libatk-bridge2.0-0
+
+        MQTT_EXPLORER_VERSION="0.4.0-beta.6"
+        MQTT_DEB="MQTT-Explorer.deb"
         print_info "Downloading MQTT Explorer ${MQTT_EXPLORER_VERSION}"
-        wget -q "https://github.com/thomasnordquist/MQTT-Explorer/releases/download/v${MQTT_EXPLORER_VERSION}/${MQTT_DEB}"
         
-        if [ -f "${MQTT_DEB}" ]; then
-            sudo dpkg -i "${MQTT_DEB}"
-            sudo apt-get install -f -y
+        # Using the correct package URL with updated version
+        if wget -q --show-progress "https://github.com/thomasnordquist/MQTT-Explorer/releases/download/v${MQTT_EXPLORER_VERSION}/mqtt-explorer_${MQTT_EXPLORER_VERSION}_amd64.deb" -O "${MQTT_DEB}"; then
+            print_success "Download completed"
+            
+            # Install the package and handle dependencies
+            if sudo dpkg -i "${MQTT_DEB}"; then
+                print_success "Initial installation successful"
+            else
+                print_info "Fixing dependencies..."
+                sudo apt-get install -f -y
+                sudo dpkg -i "${MQTT_DEB}"
+            fi
+            
+            # Cleanup
             rm "${MQTT_DEB}"
-            check_status "MQTT Explorer" $?
-            track_change "MQTT Explorer Installation" "Version ${MQTT_EXPLORER_VERSION}"
+            
+            if dpkg -l | grep -q mqtt-explorer; then
+                check_status "MQTT Explorer" 0
+                track_change "MQTT Explorer Installation" "Version ${MQTT_EXPLORER_VERSION}"
+                print_success "MQTT Explorer installed successfully"
+            else
+                check_status "MQTT Explorer" 1
+                print_error "MQTT Explorer installation failed"
+            fi
         else
             print_error "Failed to download MQTT Explorer"
             FAILED_PACKAGES["MQTT Explorer"]="Download failed"
+            log_message "ERROR" "Failed to download MQTT Explorer"
         fi
     else
         SKIPPED_PACKAGES["MQTT Explorer"]="Already installed"
         print_info "MQTT Explorer already installed"
     fi
 }
-
 # Main script execution
 print_section "Starting Environment Setup"
 log_message "INFO" "Starting installation script"
