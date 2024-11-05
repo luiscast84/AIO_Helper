@@ -351,6 +351,7 @@ create_storage_account() {
         --name "$st_name" \
         --resource-group "$resource_group" \
         --location "$location" \
+        --enable-hierarchical-namespace \
         --sku "Standard_LRS" \
         --kind "StorageV2" \
         --https-only true \
