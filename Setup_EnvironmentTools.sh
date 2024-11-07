@@ -185,9 +185,11 @@ verify_and_load_environment() {
     
     # Configure kubectl bash completion if kubectl is available
     if command_exists kubectl; then
-        if ! grep -q "kubectl completion bash" ~/.bashrc; then
+        if ! grep -q "source <(kubectl completion bash)" ~/.bashrc; then
+            # First ensure the completion script is available in the completion directory
             kubectl completion bash | sudo tee /etc/bash_completion.d/kubectl > /dev/null
-            echo 'source <(kubectl completion bash)' >>~/.bashrc
+            # Then add the source command to .bashrc
+            echo 'source /etc/bash_completion.d/kubectl' >>~/.bashrc
             print_success "Added kubectl completion to ~/.bashrc"
             track_change "Shell Configuration" "Added kubectl completion"
         else
@@ -197,9 +199,11 @@ verify_and_load_environment() {
     
     # Configure Azure CLI completion if available
     if command_exists az; then
-        if ! grep -q "az completion bash" ~/.bashrc; then
+        if ! grep -q "source /etc/bash_completion.d/azure-cli" ~/.bashrc; then
+            # First ensure the completion script is available
             az completion bash | sudo tee /etc/bash_completion.d/azure-cli > /dev/null
-            echo 'source <(az completion bash)' >>~/.bashrc
+            # Then add the source command to .bashrc
+            echo 'source /etc/bash_completion.d/azure-cli' >>~/.bashrc
             print_success "Added Azure CLI completion to ~/.bashrc"
             track_change "Shell Configuration" "Added Azure CLI completion"
         else
@@ -209,14 +213,18 @@ verify_and_load_environment() {
     
     # Configure PowerShell completion if available
     if command_exists pwsh; then
-        if ! grep -q "Register-ArgumentCompleter -Native -CommandName pwsh" ~/.bashrc; then
-            echo 'Register-ArgumentCompleter -Native -CommandName pwsh -ScriptBlock {
-                param($commandName, $wordToComplete, $cursorPosition)
-                pwsh -NoProfile -Command {
-                    param($wordToComplete)
-                    Get-Command "$wordToComplete*" | Select-Object -ExpandProperty Name
-                } -Args $wordToComplete
-            }' | sudo tee /etc/bash_completion.d/pwsh > /dev/null
+        if ! grep -q "source /etc/bash_completion.d/powershell" ~/.bashrc; then
+            # Create PowerShell completion script
+            cat << 'EOF' | sudo tee /etc/bash_completion.d/powershell > /dev/null
+function _powershell_completion {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local completions=$(pwsh -NoProfile -Command "Get-Command '$cur*' | Select-Object -ExpandProperty Name")
+    COMPREPLY=($(compgen -W "$completions" -- "$cur"))
+}
+complete -F _powershell_completion pwsh
+EOF
+            # Add source to .bashrc
+            echo 'source /etc/bash_completion.d/powershell' >>~/.bashrc
             print_success "Added PowerShell completion to ~/.bashrc"
             track_change "Shell Configuration" "Added PowerShell completion"
         else
