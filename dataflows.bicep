@@ -5,7 +5,7 @@ param aioInstanceName string
 param customLocationName string
 
 @description('The name of the Event Hub namespace')
-param evenHubNamespaceHost string
+param eventHubNamespaceHost string
 
 @description('The name of the Event Hub')
 param eventHubName string
@@ -38,7 +38,7 @@ resource eventhubEndpoint 'Microsoft.IoTOperations/instances/dataflowEndpoints@2
   properties: {
     endpointType: 'Kafka'
     kafkaSettings: {
-      host: evenHubNamespaceHost
+      host: eventHubNamespaceHost
       authentication: {
         method: 'SystemAssignedManagedIdentity'
         systemAssignedManagedIdentitySettings: {}
