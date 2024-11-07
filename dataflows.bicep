@@ -14,7 +14,6 @@ param eventHubName string
 param iotDataFlowName string = 'iot-mqtt-to-eventhub'
 
 @description('The name of the commercial data flow')
-param commercialDataFlowName string = 'commercial-mqtt-to-eventhub'
 param defaultDataflowEndpointName string = 'default'
 param eventHubDataflowEndpointName string = 'eventhub-endpoint'
 
@@ -82,59 +81,16 @@ resource iotDataFlow 'Microsoft.IoTOperations/instances/dataflowProfiles/dataflo
         sourceSettings: {
           endpointRef: defaultDataflowEndpointName
           dataSources: [
-            'iot/devices/#'
-          ]
-        }
-      }
-      {
-        operationType: 'BuiltInTransformation'
-        builtInTransformationSettings: {
-          // See transformation configuration section
-        }
-      }
-      {
-        operationType: 'Destination'
-        destinationSettings: {
-          endpointRef: eventHubDataflowEndpointName
-          dataDestination: eventHubName // See section on configuring data destination
-        }
-      }
-    ]
-  }
-}
-
-resource commercialDataFlow 'Microsoft.IoTOperations/instances/dataflowProfiles/dataflows@2024-09-15-preview' = {
-  // Reference to the parent dataflow profile, the default profile in this case
-  // Same usage as profileRef in Kubernetes YAML
-  parent: defaultDataflowProfile
-  name: commercialDataFlowName
-  extendedLocation: {
-    name: customLocation.id
-    type: 'CustomLocation'
-  }
-  properties: {
-    mode: 'Enabled'
-    operations: [
-      {
-        operationType: 'Source'
-        sourceSettings: {
-          endpointRef: defaultDataflowEndpointName
-          dataSources: [
+            'iot/#'
             'topic/commercial'
           ]
         }
       }
       {
-        operationType: 'BuiltInTransformation'
-        builtInTransformationSettings: {
-          // See transformation configuration section
-        }
-      }
-      {
         operationType: 'Destination'
         destinationSettings: {
           endpointRef: eventHubDataflowEndpointName
-          dataDestination: eventHubName
+          dataDestination: eventHubName 
         }
       }
     ]
