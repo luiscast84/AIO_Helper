@@ -164,7 +164,7 @@ You can check all the variables here:
 
 - [ ] `az iot ops check`
 
-!IMAGE [verify host.png](instructions277358/verify host.png)
+!IMAGE[aio_checknew.png](instructions277358/aio_checknew.png)
 
 **4. Create and export an Schema Registry for Azure IoT Operations:**
 > [!knowledge] Schemas are documents that describe the format of a message and its contents to enable processing and contextualization. The schema registry is a synchronized repository in the cloud and at the edge. The schema registry stores the definitions of messages coming from edge assets, and then exposes an API to access those schemas at the edge. The schema registry is backed by a cloud storage account. This storage account was pre-created as part of the lab setup.
